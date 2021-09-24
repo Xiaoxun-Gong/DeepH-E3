@@ -11,8 +11,8 @@ from torch import optim, nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import SubsetRandomSampler, DataLoader
 
-from e3Aij import AijData, Collater, Net
-from utils import LossRecord
+from e3Aij import AijData, Collater, Net, LossRecord
+
 
 parser = argparse.ArgumentParser(description='Predict Hamiltonian')
 parser.add_argument('--input_dir', type=str, default='processed/openmx_test', help='')
