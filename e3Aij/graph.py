@@ -199,10 +199,18 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
     edge_idx_first = torch.LongTensor(edge_idx_first)
     # edge_idx_first = torch.arange(num_atom).unsqueeze(1).expand(-1, max_num_nbr).reshape(-1)
     edge_idx = torch.stack([edge_idx_first, torch.LongTensor(edge_idx)])
+    
+    # edge_key: [shape num_edge,5], each row [Rx, Ry, Rz, i, j] where i and j both start from 1
+    # to get the hopping key for ith edge, use str(edge_key[i].tolist())
+    inv_lattice = torch.inverse(lattice).type(default_dtype_torch)
+    i, j = edge_idx
+    R = torch.round((cart_coords[i] + edge_fea[:, 1:4] - cart_coords[j]) @ inv_lattice).int()
+    edge_key = torch.cat([R, (i + 1).unsqueeze(1), (j + 1).unsqueeze(1)], dim=1)
 
     if data_folder is not None:
         if inference:
             data = Data(x=numbers, edge_index=edge_idx, edge_attr=edge_fea, stru_id=stru_id,
+                        edge_key=edge_key,
                         Aij=None,
                         Aij_mask=None,
                         atom_num_orbital=torch.tensor(atom_num_orbital),
@@ -220,16 +228,11 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
                     Aij = torch.full([edge_fea.shape[0], max_num_orbital, max_num_orbital], np.nan,
                                      dtype=default_dtype_torch)
 
-                inv_lattice = torch.inverse(lattice).type(default_dtype_torch)
                 for index in range(edge_fea.shape[0]):
-                    # h_{i0, jR} i and j is 0-based index
                     i, j = edge_idx[:, index]
-                    cart_coords_i = cart_coords[i]
-                    cart_coords_j = cart_coords_i + edge_fea[index, 1:4]
-                    cart_coords_j_unit_cell = cart_coords[j]
-                    R = torch.round((cart_coords_j - cart_coords_j_unit_cell) @ inv_lattice).int().tolist()
-
-                    key = (*R, i.item(), j.item())
+                    key = edge_key[index]
+                    key[3:5] -= 1 # h_{i0, jR} i and j is 0-based index
+                    key = tuple(key.tolist())
                     if key in Aij_dict:
                         Aij_mask[index] = True
                         if spinful:
@@ -242,7 +245,7 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
 
                 data = Data(x=numbers, edge_index=edge_idx, edge_attr=edge_fea, stru_id=stru_id,
                             pos=cart_coords.type(default_dtype_torch), lattice=lattice.unsqueeze(0),
-                            Aij=Aij, Aij_mask=Aij_mask,
+                            edge_key=edge_key, Aij=Aij, Aij_mask=Aij_mask,
                             atom_num_orbital=torch.tensor(atom_num_orbital),
                             spinful=spinful,
                             **kwargs)
@@ -280,6 +283,7 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
 
                 data = Data(x=numbers, edge_index=edge_idx, edge_attr=edge_fea, stru_id=stru_id,
                             pos=cart_coords.type(default_dtype_torch), lattice=lattice.unsqueeze(0),
+                            edge_key=edge_key, 
                             Aij=Aij, Aij_edge_index=Aij_edge_index, Aij_edge_attr=Aij_edge_fea,
                             atom_num_orbital=torch.tensor(atom_num_orbital),
                             spinful=spinful,

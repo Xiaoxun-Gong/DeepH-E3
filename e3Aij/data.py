@@ -9,7 +9,7 @@ import torch
 from torch_geometric.data import InMemoryDataset
 from pathos.multiprocessing import ProcessingPool as Pool
 
-from .graph import get_graph
+from .graph import get_graph, load_orbital_types
 
 class AijData(InMemoryDataset):
     def __init__(self, raw_data_dir: str, graph_dir: str, target: str,
@@ -129,9 +129,17 @@ raw_data_dir
         spinful = data_list[0].spinful
         for d in data_list:
             assert spinful == d.spinful
+            
+        _, orbital_types = load_orbital_types(path=os.path.join(folder_list[0], 'orbital_types.dat'),
+                                           return_orbital_types=True) 
+        elements = np.loadtxt(os.path.join(folder_list[0], 'element.dat'))
+        orbital_types_new = []
+        for i in range(len(index_to_Z)):
+            orbital_types_new.append(orbital_types[np.where(elements == index_to_Z[i].numpy())[0][0]])
+        #TODO 数据集包含不同元素
 
         data, slices = self.collate(data_list)
-        torch.save((data, slices, dict(spinful=spinful, index_to_Z=index_to_Z, Z_to_index=Z_to_index)), self.data_file)
+        torch.save((data, slices, dict(spinful=spinful, index_to_Z=index_to_Z, Z_to_index=Z_to_index, orbital_types=orbital_types_new)), self.data_file)
         print('Finish saving %d structures to raw_data_file, have cost %d seconds' % (len(data_list), time.time() - begin))
 
     def element_statistics(self, data_list):
@@ -145,9 +153,35 @@ raw_data_dir
 
         return index_to_Z, Z_to_index
 
-    def set_mask(self):
-        self.equivariant_blocks = [{"42 42": [3, 6, 9, 14], "42 16": [3, 6, 8, 13], "16 42": [2, 5, 9, 14], "16 16": [2, 5, 8, 13]}]
+    def set_mask(self, targets):
+        # = process the orbital indices into block slices =
+        orbital_types = self.info['orbital_types']
+        orbital_types = list(map(lambda x: np.array(x, dtype=np.int32), orbital_types))
+        orbital_types_cumsum = list(map(lambda x: np.concatenate([np.zeros(1, dtype=np.int32), 
+                                                                  np.cumsum(2 * x + 1)]), orbital_types))
+        #! equivariant_blocks, out_js_list, label init
+        equivariant_blocks, out_js_list = [], []
+        equivariant_block = dict()
+        for target in targets:
+            out_js = None
+            for N_M_str, block_indices in target.items():
+                i, j = map(lambda x: self.info["Z_to_index"][int(x)], N_M_str.split())
+                block_slice = [
+                    orbital_types_cumsum[i][block_indices[0]],
+                    orbital_types_cumsum[i][block_indices[0] + 1],
+                    orbital_types_cumsum[j][block_indices[1]],
+                    orbital_types_cumsum[j][block_indices[1] + 1]
+                ]
+                equivariant_block.update({N_M_str: block_slice})
+                if out_js is None:
+                    out_js = (orbital_types[i][block_indices[0]], orbital_types[j][block_indices[1]])
+                else:
+                    assert out_js == (orbital_types[i][block_indices[0]], orbital_types[j][block_indices[1]])
+            equivariant_blocks.append(equivariant_block)
+            out_js_list.append(tuple(map(int, out_js)))
+        self.equivariant_blocks = equivariant_blocks # [{"42 42": [3, 6, 9, 14], "42 16": [3, 6, 8, 13], "16 42": [2, 5, 9, 14], "16 16": [2, 5, 8, 13]}]
         # self.equivariant_blocks = [{"42 42": [3, 6, 3, 6]}]
+        # self.equivariant_blocks = [{"42 42": [0, 1, 0, 1], "42 16": [0, 1, 0, 1], "16 42": [0, 1, 0, 1], "16 16": [0, 1, 0, 1]}]
         assert len(self.equivariant_blocks) == 1
 
         begin = time.time()
@@ -163,7 +197,6 @@ raw_data_dir
                     assert block_len == (block_slice[1] - block_slice[0]) * (block_slice[3] - block_slice[2])
             out_fea_len += block_len
             out_indices_list.append(out_indices_list[-1] + block_len)
-        out_js_list = [(1, 2)]
 
         data_list_mask = []
         for data in self:
@@ -174,7 +207,8 @@ raw_data_dir
 
             # mask = torch.zeros(data.num_edges, out_fea_len, dtype=torch.int8)
             # label = torch.zeros(data.num_edges, out_fea_len, dtype=torch.get_default_dtype())
-            label = torch.zeros(data.num_edges, 3, 5, dtype=torch.get_default_dtype())
+            block_size = map(lambda x: 2 * x + 1, out_js_list[0])
+            label = torch.zeros(data.num_edges, *block_size, dtype=torch.get_default_dtype()) # TODO have only considered one target here
 
             atomic_number_edge_i = data.x[data.edge_index[0]]
             atomic_number_edge_j = data.x[data.edge_index[1]]
@@ -203,6 +237,6 @@ raw_data_dir
         self._data_list = None
         data, slices = self.collate(data_list_mask)
         self.data, self.slices = data, slices
-        print(f"Finisht setting mask for dataset, cost {time.time() - begin:.2f} seconds")
+        print(f"Finished setting mask for dataset, cost {time.time() - begin:.2f} seconds")
 
         return out_js_list

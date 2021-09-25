@@ -193,8 +193,8 @@ def test_nn():
     edge_Aij = True
 
     dataset = AijData(
-        raw_data_dir="/home/lihe/e3nn/e3nn_DeepH/processed",
-        graph_dir="/home/lihe/e3nn/graph_data",
+        raw_data_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/processed",
+        graph_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/graph_data",
         target="hamiltonian",
         dataset_name="test_MoS2",
         multiprocessing=False,
@@ -215,7 +215,7 @@ def test_nn():
                               collate_fn=Collater(edge_Aij))
     net = Net(
         num_species=num_species,
-        irreps_embed="16x0e",
+        irreps_embed_node="16x0e",
         irreps_sh='1x0e+1x1o+1x2e+1x3o+1x4e',
         irreps_mid_node='10x0e+8x1o',
         irreps_post_node="6x0e+6x1o+6x2e",
@@ -332,7 +332,7 @@ def test_nn():
 
 
 def test_Rij():
-    device = torch.device("cuda")
+    device = torch.device("cpu")
     torch.autograd.set_detect_anomaly(True)
     seed = 42
     np.random.seed(seed)
@@ -355,8 +355,8 @@ def test_Rij():
     edge_Aij = True
 
     dataset = AijData(
-        raw_data_dir="/home/lihe/e3nn/e3nn_DeepH/processed",
-        graph_dir="/home/lihe/e3nn/graph_data",
+        raw_data_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/processed",
+        graph_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/graph_data",
         target="hamiltonian",
         dataset_name="test_MoS2",
         multiprocessing=False,
@@ -377,7 +377,7 @@ def test_Rij():
                               collate_fn=Collater(edge_Aij))
     net = Net(
         num_species=num_species,
-        irreps_embed="16x0e",
+        irreps_embed_node="16x0e",
         irreps_sh='1x0e+1x1o+1x2e+1x3o+1x4e',
         # irreps_mid_node='16x0e+8x1o',
         # irreps_post_node="16x0e+8x1o",
@@ -406,7 +406,7 @@ def test_Rij():
 
     begin_time = time.time()
     net.train()
-    for epoch in range(10000):
+    for epoch in range(1000):
         learning_rate = optimizer.param_groups[0]['lr']
         for batch in train_loader:
             losses = LossRecord()
@@ -597,7 +597,7 @@ def test_Rij():
 
 
 def test_Hij():
-    device = torch.device('cuda')
+    device = torch.device('cpu')
     seed = 42
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -619,10 +619,10 @@ def test_Hij():
     edge_Aij = True
 
     dataset = AijData(
-        raw_data_dir="/home/lihe/e3nn/e3nn_DeepH/processed",
-        graph_dir="/home/lihe/e3nn/graph_data",
+        raw_data_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/processed",
+        graph_dir="/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0923/graph_data",
         target="hamiltonian",
-        dataset_name="test_MoS2",
+        dataset_name="test_MoS2_new",
         multiprocessing=False,
         # radius=5.0,
         radius=7.4,
@@ -639,24 +639,46 @@ def test_Hij():
     test_loader = DataLoader(dataset, batch_size=1,
                              shuffle=False, sampler=SubsetRandomSampler([0]),
                              collate_fn=Collater(edge_Aij))
+    
+    begin = time.time()
+    print('Building model...')
     net = Net(
         num_species=num_species,
-        irreps_embed="16x0e",
-        irreps_sh='1x0e+1x1o+1x2e+1x3o+1x4e',
-        irreps_mid_node='16x0e+8x1o',
-        irreps_post_node="16x0e+8x1o+6x2e",
+        irreps_embed_node="32x0e",
+        irreps_edge_init='64x0e',
+        irreps_sh='1x0e + 1x1o + 1x2e + 1x3o + 1x4e',
+        irreps_mid_node='16x0e + 16x0o + 8x1e + 8x1o',
+        irreps_post_node='16x0e + 16x0o + 8x1e + 8x1o + 4x2e + 4x2o',
         irreps_out_node="1x0e",
-        irreps_mid_edge="12x0e+10x1o",
-        irreps_post_edge="12x0e+10x1o+4x2e",
+        irreps_mid_edge='16x0e + 16x0o + 8x1e + 8x1o',
+        irreps_post_edge='16x0e + 16x0o + 8x1e + 8x1o + 4x2e + 4x2o',
         irreps_out_edge="4x1o+4x2e",
-        num_block=5,
+        num_block=3,
         use_sc=False,
-        r_max=7.4,
+        r_max = 7.4,
     )
+    # net = Net(
+    #     num_species=num_species,
+    #     irreps_embed_node="64x0e",
+    #     irreps_edge_init="64x0e",
+    #     irreps_sh='1x0e + 1x1o + 1x2e + 1x3o + 1x4e',
+    #     irreps_mid_node='64x0e + 64x0o + 32x1e + 32x1o + 16x2e + 16x2o + 8x3e + 8x3o + 4x4e + 4x4o',
+    #     irreps_post_node="64x0e + 64x0o + 32x1e + 32x1o + 16x2e + 16x2o + 8x3e + 8x3o + 4x4e + 4x4o",
+    #     irreps_out_node="1x0e",
+    #     irreps_mid_edge="64x0e + 64x0o + 32x1e + 32x1o + 16x2e + 16x2o + 8x3e + 8x3o + 4x4e + 4x4o",
+    #     irreps_post_edge="64x0e + 64x0o + 32x1e + 32x1o + 16x2e + 16x2o + 8x3e + 8x3o + 4x4e + 4x4o",
+    #     irreps_out_edge="4x1o+4x2e",
+    #     num_block=5,
+    #     use_sc=False,
+    #     r_max=7.4,
+    # )
+    print(f'Finished building model, cost {time.time() - begin:.2f} seconds.')
 
     model_parameters = filter(lambda p: p.requires_grad, net.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])
     print("The model you built has: %d parameters" % params)
+    
+    print(net)
 
     model_parameters = filter(lambda p: p.requires_grad, net.parameters())
     optimizer = optim.Adam(model_parameters, lr=0.005, betas=(0.9, 0.999))
@@ -678,6 +700,7 @@ def test_Hij():
                 + output_edge[:, 9:12][:, :, None] * output_edge[:, 27:32][:, None, :],
                 1, 2
             )
+            # H_pred = output_edge.unsqueeze(-1)
 
             loss = criterion(H_pred, batch.label)
             optimizer.zero_grad()
@@ -694,8 +717,7 @@ def test_Hij():
         begin_time = time.time()
 
         if epoch == 1000:
-            print(H_pred)
-            print(batch.label)
+            # torch.save(net.state_dict(), '/home/gongxx/projects/DeepH/e3nn_DeepH/test_runs/0927/model1.pkl')
             mzjb
 
 
@@ -816,7 +838,7 @@ def test_Hij():
 
 
 if __name__ == '__main__':
-    # test_Hij()
-    test_Rij()
+    test_Hij()
+    # test_Rij()
     # test_nn()
     # test_rotate_Hamiltonian()
