@@ -5,9 +5,10 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser(description='Process data from openmx output.')
 parser.add_argument('--input_dir', type=str, default='/home/lihe/hdd/materials_data/MoS2/md_openmx/configuration/', help='Every folder under input_dir containing openmx.scfout will be recognized as a structure folder.')
 parser.add_argument('--output_dir', type=str, default='/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/1004_MoS2/processed/', help='Processed structure information will be stored here.')
+parser.add_argument('--simpout', action='store_true', help='Supress the output of each data processor.')
 args = parser.parse_args()
 
-supress_output = True
+supress_output = args.simpout
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -17,6 +18,7 @@ for root, dirs, files in os.walk(args.input_dir):
     if 'openmx.scfout' in files:
         stru_path_list.append(os.path.abspath(root))
 
+assert len(stru_path_list) > 0, 'cannot find any structure'
 print(f'Found {len(stru_path_list)} structures.')      
         
 # = process structures
@@ -30,4 +32,5 @@ for stru_input_path in stru_path_list_iter:
     # TODO might need modification
     cmd = f'julia get_data.jl --input_dir {stru_input_path} --output_dir {stru_output_path}' + \
            (' > /dev/null 2>&1' if supress_output else '')
-    os.system(cmd)
+    return_code = os.system(cmd)
+    assert return_code == 0, f'Error occured in executing command "{cmd}". Try not to include --simpout to see error messages.'

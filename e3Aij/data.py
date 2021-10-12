@@ -10,11 +10,12 @@ from torch_geometric.data import InMemoryDataset
 from pathos.multiprocessing import ProcessingPool as Pool
 
 from .graph import get_graph, load_orbital_types
+from .utils import process_targets
 
 class AijData(InMemoryDataset):
     def __init__(self, raw_data_dir: str, graph_dir: str, target: str,
                  dataset_name : str, multiprocessing: bool, radius: float, max_num_nbr: int, edge_Aij: bool,
-                 default_dtype_torch, nums: int = None, inference:bool = False):
+                 default_dtype_torch, nums: int = None, inference:bool = False, only_ij: bool = False):
         """
         :param raw_data_dir: 原始数据目录, 允许存在嵌套
 when interface == 'h5',
@@ -51,9 +52,9 @@ raw_data_dir
         self.raw_data_dir = raw_data_dir
         assert dataset_name.find('-') == -1, '"-" can not be included in the dataset name'
         if target == 'hamiltonian':
-            graph_file_name = f'HGraph-{dataset_name}-{radius}r{max_num_nbr}mn-edge{"" if edge_Aij else "!"}=Aij.pkl'
+            graph_file_name = f'HGraph-{dataset_name}-{radius}r{max_num_nbr}mn-edge{"" if edge_Aij else "!"}=Aij{"-undrct" if only_ij else ""}.pkl' # undrct = undirected
         elif target == 'density_matrix':
-            graph_file_name = f'DMGraph-{dataset_name}-{radius}r{max_num_nbr}mn-{edge_Aij}edge.pkl'
+            graph_file_name = f'DMGraph-{dataset_name}-{radius}r{max_num_nbr}mn-{edge_Aij}edge{"-undrct" if only_ij else ""}.pkl'
         else:
             raise ValueError('Unknown prediction target: {}'.format(target))
         self.data_file = os.path.join(graph_dir, graph_file_name)
@@ -70,6 +71,7 @@ raw_data_dir
 
         self.nums = nums
         self.inference = inference
+        self.only_ij = only_ij
         self.transform = None
         self.__indices__ = None
         self.__data_list__ = None
@@ -80,6 +82,7 @@ raw_data_dir
         if os.path.exists(self.data_file):
             print('Use existing graph data file')
         else:
+            assert raw_data_dir, 'Required graph does not exist, or graph filename cannot be correctly identified'
             print('Process new data file......')
             self.process()
         begin = time.time()
@@ -104,7 +107,7 @@ raw_data_dir
         lattice = torch.tensor(structure.lattice.matrix, dtype=self.default_dtype_torch)
         return get_graph(cart_coords, frac_coords, numbers, stru_id, r=self.radius, max_num_nbr=self.max_num_nbr,
                          edge_Aij=self.edge_Aij, lattice=lattice, default_dtype_torch=self.default_dtype_torch,
-                         data_folder=folder, target_file_name=self.target_file_name, inference=self.inference, **kwargs)
+                         data_folder=folder, target_file_name=self.target_file_name, inference=self.inference, only_ij=self.only_ij, **kwargs)
 
     def process(self):
         begin = time.time()
@@ -140,7 +143,7 @@ raw_data_dir
 
         data, slices = self.collate(data_list)
         torch.save((data, slices, dict(spinful=spinful, index_to_Z=index_to_Z, Z_to_index=Z_to_index, orbital_types=orbital_types_new)), self.data_file)
-        print('Finish saving %d structures to raw_data_file, have cost %d seconds' % (len(data_list), time.time() - begin))
+        print('Finished saving %d structures to raw_data_file, have cost %d seconds' % (len(data_list), time.time() - begin))
 
     def element_statistics(self, data_list):
         # TODO 没有处理数据集包括不同元素组成的情况
@@ -154,49 +157,11 @@ raw_data_dir
         return index_to_Z, Z_to_index
 
     def set_mask(self, targets):
-        # = process the orbital indices into block slices =
-        orbital_types = self.info['orbital_types']
-        orbital_types = list(map(lambda x: np.array(x, dtype=np.int32), orbital_types))
-        orbital_types_cumsum = list(map(lambda x: np.concatenate([np.zeros(1, dtype=np.int32), 
-                                                                  np.cumsum(2 * x + 1)]), orbital_types))
-        #! equivariant_blocks, out_js_list, label init
-        equivariant_blocks, out_js_list = [], []
-        equivariant_block = dict()
-        for target in targets:
-            out_js = None
-            for N_M_str, block_indices in target.items():
-                i, j = map(lambda x: self.info["Z_to_index"][int(x)], N_M_str.split())
-                block_slice = [
-                    orbital_types_cumsum[i][block_indices[0]],
-                    orbital_types_cumsum[i][block_indices[0] + 1],
-                    orbital_types_cumsum[j][block_indices[1]],
-                    orbital_types_cumsum[j][block_indices[1] + 1]
-                ]
-                equivariant_block.update({N_M_str: block_slice})
-                if out_js is None:
-                    out_js = (orbital_types[i][block_indices[0]], orbital_types[j][block_indices[1]])
-                else:
-                    assert out_js == (orbital_types[i][block_indices[0]], orbital_types[j][block_indices[1]])
-            equivariant_blocks.append(equivariant_block)
-            out_js_list.append(tuple(map(int, out_js)))
-        self.equivariant_blocks = equivariant_blocks # [{"42 42": [3, 6, 9, 14], "42 16": [3, 6, 8, 13], "16 42": [2, 5, 9, 14], "16 16": [2, 5, 8, 13]}]
-        # self.equivariant_blocks = [{"42 42": [3, 6, 3, 6]}]
-        # self.equivariant_blocks = [{"42 42": [0, 1, 0, 1], "42 16": [0, 1, 0, 1], "16 42": [0, 1, 0, 1], "16 16": [0, 1, 0, 1]}]
-        assert len(self.equivariant_blocks) == 1
-
         begin = time.time()
-        print("Set mask for dataset")
-        out_fea_len = 0
-        out_indices_list = [0]
-        for index_out, equivariant_block in enumerate(self.equivariant_blocks):
-            block_len = None
-            for N_M_str, block_slice in equivariant_block.items():
-                if block_len is None:
-                    block_len = (block_slice[1] - block_slice[0]) * (block_slice[3] - block_slice[2])
-                else:
-                    assert block_len == (block_slice[1] - block_slice[0]) * (block_slice[3] - block_slice[2])
-            out_fea_len += block_len
-            out_indices_list.append(out_indices_list[-1] + block_len)
+        print("Setting mask for dataset...")
+        
+        equivariant_blocks, out_js_list, out_slices = process_targets(self.info['orbital_types'], self.info["index_to_Z"], targets)
+        self.equivariant_blocks = equivariant_blocks
 
         data_list_mask = []
         for data in self:
@@ -205,29 +170,31 @@ raw_data_dir
                 if not torch.all(data.Aij_mask):
                     raise NotImplementedError("Not yet have support for graph radius including Aij without calculation")
 
-            # mask = torch.zeros(data.num_edges, out_fea_len, dtype=torch.int8)
-            # label = torch.zeros(data.num_edges, out_fea_len, dtype=torch.get_default_dtype())
-            block_size = map(lambda x: 2 * x + 1, out_js_list[0])
-            label = torch.zeros(data.num_edges, *block_size, dtype=torch.get_default_dtype()) # TODO have only considered one target here
+            mask = torch.zeros(data.num_edges, out_slices[-1], dtype=torch.int8)
+            # label of each edge is a vector which is each target H block flattened and concatenated
+            label = torch.zeros(data.num_edges, out_slices[-1], dtype=torch.get_default_dtype())
 
             atomic_number_edge_i = data.x[data.edge_index[0]]
             atomic_number_edge_j = data.x[data.edge_index[1]]
 
             for index_out, equivariant_block in enumerate(self.equivariant_blocks):
-                assert index_out == 0
                 for N_M_str, block_slice in equivariant_block.items():
                     condition_atomic_number_i, condition_atomic_number_j = map(lambda x: self.info["Z_to_index"][int(x)], N_M_str.split())
                     condition_slice_i = slice(block_slice[0], block_slice[1])
                     condition_slice_j = slice(block_slice[2], block_slice[3])
                     if data.Aij is not None:
+                        out_slice = slice(out_slices[index_out], out_slices[index_out + 1])
                         condition_index = torch.where(
                             (atomic_number_edge_i == condition_atomic_number_i)
                             & (atomic_number_edge_j == condition_atomic_number_j)
                         )
-                        label[condition_index] += data.Aij[:, condition_slice_i, condition_slice_j][condition_index]
+                        label[condition_index[0], out_slice] += data.Aij[:, condition_slice_i, condition_slice_j].reshape(data.num_edges, -1)[condition_index]
+                        mask[condition_index[0], out_slice] += 1
             del data.Aij_mask
             if data.Aij is not None:
                 data.label = label
+                assert torch.all((mask == 1) | (mask == 0)), 'Some blocks are required to predict multiple times'
+                data.mask = mask.bool()
                 del data.Aij
             data_list_mask.append(data)
 
@@ -239,4 +206,4 @@ raw_data_dir
         self.data, self.slices = data, slices
         print(f"Finished setting mask for dataset, cost {time.time() - begin:.2f} seconds")
 
-        return out_js_list
+        return out_js_list, out_slices
