@@ -2,20 +2,60 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch_scatter import scatter
+from torch_geometric.utils import degree
 from e3nn.nn import FullyConnectedNet, Gate, BatchNorm, NormActivation, Extract
 from e3nn.o3 import TensorProduct, Irrep, Irreps, Linear, SphericalHarmonics, FullyConnectedTensorProduct
 from .from_nequip.cutoffs import PolynomialCutoff
 from .from_nequip.radial_basis import BesselBasis
 from .from_nequip.tp_utils import tp_path_exists
 from .from_schnetpack.acsf import GaussianBasis
-from .utils import sort_irreps
+from .e3modules import sort_irreps, e3LayerNorm, e3ElementWise
 
 
 epsilon = 1e-8
 
+def get_gate_nonlin(irreps_in1, irreps_in2, irreps_out, 
+                    act = {1: torch.nn.functional.silu, -1: torch.tanh}, 
+                    act_gates  = {1: torch.sigmoid, -1: torch.tanh}
+                    ):
+    # get gate nonlinearity after tensor product
+    # irreps_in1 and irreps_in2 are irreps to be multiplied in tensor product
+    # irreps_out is desired irreps after gate nonlin
+    # notice that nonlin.irreps_out might not be exactly equal to irreps_out
+    
+    irreps_scalars = Irreps([
+        (mul, ir)
+        for mul, ir in irreps_out
+        if ir.l == 0 and tp_path_exists(irreps_in1, irreps_in2, ir)
+    ]).simplify()
+    irreps_gated = Irreps([
+        (mul, ir)
+        for mul, ir in irreps_out
+        if ir.l > 0 and tp_path_exists(irreps_in1, irreps_in2, ir)
+    ]).simplify()
+    if irreps_gated.dim > 0:
+        if tp_path_exists(irreps_in1, irreps_in2, "0e"):
+            ir = "0e"
+        elif tp_path_exists(irreps_in1, irreps_in2, "0o"):
+            ir = "0o"
+        else:
+            raise ValueError(
+                f"irreps_in1={irreps_in1} times irreps_in2={irreps_in2} is unable to produce gates needed for irreps_gated={irreps_gated}")
+    else:
+        ir = None
+    irreps_gates = Irreps([(mul, ir) for mul, _ in irreps_gated]).simplify()
+
+    gate_nonlin = Gate(
+        irreps_scalars, [act[ir.p] for _, ir in irreps_scalars],  # scalar
+        irreps_gates, [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
+        irreps_gated  # gated tensors
+    )
+    
+    return gate_nonlin
+
 
 class EquiConv(nn.Module):
-    def __init__(self, fc_len_in, irreps_in1, irreps_in2, irreps_out,
+    def __init__(self, fc_len_in, irreps_in1, irreps_in2, irreps_out, norm='', nonlin=True,
                  weight_layers=1, weight_neurons=32,
                  act = {1: torch.nn.functional.silu, -1: torch.tanh},
                  act_gates = {1: torch.sigmoid, -1: torch.tanh}
@@ -26,82 +66,57 @@ class EquiConv(nn.Module):
         irreps_in2 = Irreps(irreps_in2)
         irreps_out = Irreps(irreps_out)
         
-        # gate nonlinearity after tensor product
-        irreps_scalars = Irreps([
-            (mul, ir)
-            for mul, ir in irreps_out
-            if ir.l == 0 and tp_path_exists(irreps_in1, irreps_in2, ir)
-        ]).simplify()
-        irreps_gated = Irreps([
-            (mul, ir)
-            for mul, ir in irreps_out
-            if ir.l > 0 and tp_path_exists(irreps_in1, irreps_in2, ir)
-        ]).simplify()
-        if irreps_gated.dim > 0:
-            if tp_path_exists(irreps_in1, irreps_in2, "0e"):
-                ir = "0e"
-            elif tp_path_exists(irreps_in1, irreps_in2, "0o"):
-                ir = "0o"
-            else:
-                raise ValueError(
-                    f"irreps_in1={irreps_in1} times irreps_in2={irreps_in2} is unable to produce gates needed for irreps_gated={irreps_gated}")
+        self.nonlin = None
+        if nonlin:
+            self.nonlin = get_gate_nonlin(irreps_in1, irreps_in2, irreps_out, act, act_gates)
+            irreps_tp_out = self.nonlin.irreps_in
         else:
-            ir = None
-        irreps_gates = Irreps([(mul, ir) for mul, _ in irreps_gated]).simplify()
-
-        self.nonlin = Gate(
-            irreps_scalars, [act[ir.p] for _, ir in irreps_scalars],  # scalar
-            irreps_gates, [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
-            irreps_gated  # gated tensors
-        )
+            irreps_tp_out = Irreps([(mul, ir) for mul, ir in irreps_out if tp_path_exists(irreps_in1, irreps_in2, ir)])
         
-        # construct the uvu tensor product
-        irreps_tp_out = self.nonlin.irreps_in
-        # for _, ir in irreps_tp_out: # !
-            # assert tp_path_exists(irreps_in1, irreps_in2, ir)
-            # irreps_in1 x irreps_in2 must contain all kinds of irrep in nonlin.irreps_in 
-            # multiplicities of irrep in irreps_in1 x irreps_in2 and nonlin.irreps_in need not be exactly equal since this will be treated by the linear layer between tp and nonlin.
-        instructions = []
-        irreps_mid = []
-        k = 0
-        for i, (mul, ir1) in enumerate(irreps_in1):
-            for j, (_, ir2) in enumerate(irreps_in2):
-                for ir_out in ir1 * ir2:
-                    if ir_out in irreps_tp_out:
-                        irreps_mid.append((mul, ir_out))
-                        instructions.append((i, j, k, 'uvu', True))
-                        k += 1
-        irreps_mid, p, _ = Irreps(irreps_mid).sort()
-        instructions = [(i, j, p[k], mode, has_weight) for i, j, k, mode, has_weight in instructions]
-
-        self.tp = TensorProduct(irreps_in1, irreps_in2, irreps_mid, instructions, 
-                                shared_weights=False, internal_weights=False)
+        self.tp = FullyConnectedTensorProduct(irreps_in1, irreps_in2, irreps_tp_out, 
+                                              shared_weights=True, internal_weights=True)
         
-        # apply linear after uvu tensor product
-        self.linear = Linear(irreps_mid.simplify(), irreps_tp_out)
+        if nonlin:
+            self.cfconv = e3ElementWise(self.nonlin.irreps_out)
+            self.irreps_out = self.nonlin.irreps_out
+        else:
+            self.cfconv = e3ElementWise(irreps_tp_out)
+            self.irreps_out = irreps_tp_out
         
         # fully connected net to create tensor product weights
-        self.fc = FullyConnectedNet(
-            [fc_len_in]
-            + weight_layers * [weight_neurons]
-            + [self.tp.weight_numel],
-            nn.functional.silu,
-        )
-        
-        self.irreps_out = self.nonlin.irreps_out
-        
+        self.fc = nn.Sequential(nn.Linear(fc_len_in, 64),
+                                nn.SiLU(),
+                                nn.Linear(64, 64),
+                                nn.SiLU(),
+                                nn.Linear(64, self.cfconv.len_weight)
+                                )
 
-    def forward(self, fea_in1, fea_in2, fea_weight):
+        self.norm = None
+        if norm:
+            if norm == 'e3LayerNorm':
+                self.norm = e3LayerNorm(self.cfconv.irreps_in)
+            else:
+                raise ValueError(f'unknown norm: {norm}')
+
+    def forward(self, fea_in1, fea_in2, fea_weight, batch_edge):
+        z = self.tp(fea_in1, fea_in2)
+
+        if self.nonlin is not None:
+            z = self.nonlin(z)
+
         weight = self.fc(fea_weight)
-        z = self.tp(fea_in1, fea_in2, weight)
-        z = self.linear(z)
-        z = self.nonlin(z)
+        z = self.cfconv(z, weight)
+
+        if self.norm is not None:
+            z = self.norm(z, batch_edge)
+
+        # TODO self-connection here
         return z
 
 
 class NodeUpdateBlock(nn.Module):
-    def __init__(self, fc_len_in, irreps_sh, irreps_in_node, irreps_out_node, irreps_in_edge,
-                 act, act_gates, use_sc, concat=True, if_sort_irreps=False):
+    def __init__(self, num_species, fc_len_in, irreps_sh, irreps_in_node, irreps_out_node, irreps_in_edge,
+                 act, act_gates, use_sc=True, concat=True, only_ij=False, nonlin=False, norm='e3LayerNorm', if_sort_irreps=False):
         super(NodeUpdateBlock, self).__init__()
         irreps_in_node = Irreps(irreps_in_node)
         irreps_sh = Irreps(irreps_sh)
@@ -118,51 +133,88 @@ class NodeUpdateBlock(nn.Module):
         irreps_in2 = irreps_sh
 
         self.lin_pre = Linear(irreps_in=irreps_in_node, irreps_out=irreps_in_node)
-        #! if use_sc:
-        #     self.sc = FullyConnectedTensorProduct(irreps_in_node, irreps_in_node, self.nonlin.irreps_in)
-        self.conv = EquiConv(fc_len_in, irreps_in1, irreps_in2, irreps_out_node,  act=act, act_gates=act_gates)
-        #! self.bn = BatchNorm(self.nonlin.irreps_in, instance=True)
-        # self.lin_post = Linear(irreps_in=self.nonlin.irreps_in, irreps_out=self.nonlin.irreps_in)
+        
+        self.nonlin = None
+        if nonlin:
+            self.nonlin = get_gate_nonlin(irreps_in1, irreps_in2, irreps_out_node)
+            irreps_conv_out = self.nonlin.irreps_in
+            conv_nonlin = False
+        else:
+            irreps_conv_out = irreps_out_node
+            conv_nonlin = True
+            
+        self.conv = EquiConv(fc_len_in, irreps_in1, irreps_in2, irreps_conv_out, nonlin=conv_nonlin, act=act, act_gates=act_gates)
+        self.lin_post = Linear(irreps_in=self.conv.irreps_out, irreps_out=self.conv.irreps_out)
+        
+        if nonlin:
+            self.irreps_out = self.nonlin.irreps_out
+        else:
+            self.irreps_out = self.conv.irreps_out
+        
+        self.sc = None
+        if use_sc:
+            self.sc = FullyConnectedTensorProduct(irreps_in_node, f'{num_species}x0e', self.conv.irreps_out)
+            # self.sc = FullyConnectedTensorProduct(irreps_in_node, f'{num_species}x0e', self.irreps_out)
+            
+        self.norm = None
+        if norm:
+            if norm == 'e3LayerNorm':
+                self.norm = e3LayerNorm(self.irreps_out)
+            else:
+                raise ValueError(f'unknown norm: {norm}')
+
+        self.irreps_in_node = irreps_in_node
         self.use_sc = use_sc
         self.concat = concat
+        self.only_ij = only_ij
         self.if_sort_irreps = if_sort_irreps
-        self.irreps_out = self.conv.irreps_out
-        
-        # print("\n====node update block====")
-        # print(f'irreps_in1: {irreps_in1}')
-        # print(f'irreps_in2: {irreps_in2}')
-        # print(f'irreps_out: {self.irreps_out}\n')
 
 
-    def forward(self, node_fea, edge_sh, edge_fea, edge_length_embedded, edge_index):
+    def forward(self, node_fea, node_one_hot, edge_sh, edge_fea, edge_length_embedded, edge_index, batch, selfloop_edge):
+        if self.use_sc:
+            node_self_connection = self.sc(node_fea, node_one_hot)
+
         node_fea = self.lin_pre(node_fea)
 
-        if self.use_sc: #!
-            node_self_connection = self.sc(node_fea, node_fea)
         index_i = edge_index[0]
         index_j = edge_index[1]
         if self.concat:
             fea_in = torch.cat([node_fea[index_i], node_fea[index_j], edge_fea], dim=-1)
             if self.if_sort_irreps:
                 fea_in = self.sort(fea_in)
-            edge_update = self.conv(fea_in, edge_sh, edge_length_embedded)
+            edge_update = self.conv(fea_in, edge_sh, edge_length_embedded, batch[edge_index[0]])
         else:
-            edge_update = self.conv(node_fea[index_j], edge_sh, edge_length_embedded)
-        node_fea = scatter(edge_update, index_i, dim=0, dim_size=node_fea.shape[0])
-        # node_fea = self.bn(node_fea)
-        if self.use_sc: #!
+            edge_update = self.conv(node_fea[index_j], edge_sh, edge_length_embedded, batch[edge_index[0]])
+        
+        # reduce=mean to normalize according to number of node neighbors
+        node_fea = scatter(edge_update, index_i, dim=0, dim_size=node_fea.shape[0], reduce='mean')
+        if self.only_ij:
+            node_fea = node_fea + scatter(edge_update[~selfloop_edge], index_j[~selfloop_edge], dim=0, dim_size=node_fea.shape[0], reduce='mean')
+            
+        node_fea = self.lin_post(node_fea)
+            
+        if self.use_sc:
             node_fea = node_fea + node_self_connection
+            
+        if self.nonlin is not None:
+            node_fea = self.nonlin(node_fea)
+            
+        # TODO another linear layer here
+        
+        if self.norm is not None:
+            node_fea = self.norm(node_fea, batch)
+            
+        # TODO another nonlin here
 
-        # node_fea = self.lin_post(node_fea)
-        # node_fea = self.nonlin(node_fea)
         return node_fea
 
 
 class EdgeUpdateBlock(nn.Module):
-    def __init__(self, fc_len_in, irreps_sh, irreps_in_node, irreps_in_edge, irreps_out_edge,
-                 act, act_gates, use_sc, init_edge=False, if_sort_irreps=False):
+    def __init__(self, num_species, fc_len_in, irreps_sh, irreps_in_node, irreps_in_edge, irreps_out_edge,
+                 act, act_gates, use_sc=True, init_edge=False, nonlin=False, norm='e3LayerNorm', if_sort_irreps=False):
         super(EdgeUpdateBlock, self).__init__()
         irreps_in_node = Irreps(irreps_in_node)
+        irreps_in_edge = Irreps(irreps_in_edge)
         irreps_out_edge = Irreps(irreps_out_edge)
 
         irreps_in1 = irreps_in_node + irreps_in_node + irreps_in_edge
@@ -172,58 +224,88 @@ class EdgeUpdateBlock(nn.Module):
         irreps_in2 = irreps_sh
 
         self.lin_pre = Linear(irreps_in=irreps_in_edge, irreps_out=irreps_in_edge)
-        #! if use_sc:
-        #     self.sc = FullyConnectedTensorProduct(irreps_in_edge, irreps_in_edge, self.nonlin.irreps_in)
-        self.conv = EquiConv(fc_len_in, irreps_in1, irreps_in2, irreps_out_edge, act=act, act_gates=act_gates)
-        #! self.bn = BatchNorm(self.nonlin.irreps_in, instance=True)
-        # self.lin_post = Linear(irreps_in=self.nonlin.irreps_in, irreps_out=self.nonlin.irreps_in)
-        self.irreps_out = self.conv.irreps_out
-        self.use_sc = use_sc #!
+        
+        self.nonlin = None
+        self.lin_post = None
+        if nonlin:
+            self.nonlin = get_gate_nonlin(irreps_in1, irreps_in2, irreps_out_edge)
+            irreps_conv_out = self.nonlin.irreps_in
+            conv_nonlin = False
+        else:
+            irreps_conv_out = irreps_out_edge
+            conv_nonlin = True
+            
+        self.conv = EquiConv(fc_len_in, irreps_in1, irreps_in2, irreps_conv_out, nonlin=conv_nonlin, act=act, act_gates=act_gates)
+        self.lin_post = Linear(irreps_in=self.conv.irreps_out, irreps_out=self.conv.irreps_out)
+        
+        if use_sc:
+            self.sc = FullyConnectedTensorProduct(irreps_in_edge, f'{num_species**2}x0e', self.conv.irreps_out)
+            # self.sc = FullyConnectedTensorProduct(irreps_in_edge, f'{num_species**2}x0e', self.irreps_out)
+
+        if nonlin:
+            self.irreps_out = self.nonlin.irreps_out
+        else:
+            self.irreps_out = self.conv.irreps_out
+
+        self.norm = None
+        if norm:
+            if norm == 'e3LayerNorm':
+                self.norm = e3LayerNorm(self.irreps_out)
+            else:
+                raise ValueError(f'unknown norm: {norm}')
+            
+        self.use_sc = use_sc
         self.init_edge = init_edge
         self.if_sort_irreps = if_sort_irreps
-        
-        # print("\n====edge update block" + (' (edge_init)' if init_edge else '') + "====" )
-        # print(f'irreps_in1: {irreps_in1}')
-        # print(f'irreps_in2: {irreps_in2}')
-        # print(f'irreps_out: {self.irreps_out}\n')
+        self.irreps_in_edge = irreps_in_edge
 
-    def forward(self, node_fea, edge_sh, edge_fea, edge_length_embedded, edge_index):
+
+    def forward(self, node_fea, edge_one_hot, edge_sh, edge_fea, edge_length_embedded, edge_index, batch):
         if not self.init_edge:
+            if self.use_sc:
+                edge_self_connection = self.sc(edge_fea, edge_one_hot)
             edge_fea = self.lin_pre(edge_fea)
-            if self.use_sc: #!
-                edge_self_connection = self.sc(edge_fea, edge_fea)
+            
         index_i = edge_index[0]
         index_j = edge_index[1]
         fea_in = torch.cat([node_fea[index_i], node_fea[index_j], edge_fea], dim=-1)
         if self.if_sort_irreps:
             fea_in = self.sort(fea_in)
-        edge_fea = self.conv(fea_in, edge_sh, edge_length_embedded)
-        #! edge_fea = self.bn(edge_fea)
-        #! if self.use_sc:
-        #     edge_fea = edge_fea + edge_self_connection
+        edge_fea = self.conv(fea_in, edge_sh, edge_length_embedded, batch[edge_index[0]])
+        
+        edge_fea = self.lin_post(edge_fea)
 
-        # edge_fea = self.lin_post(edge_fea)
-        # edge_fea = self.nonlin(edge_fea)
+        if self.use_sc:
+            edge_fea = edge_fea + edge_self_connection
+            
+        if self.nonlin is not None:
+            edge_fea = self.nonlin(edge_fea)
+
+        if self.norm is not None:
+            edge_fea = self.norm(edge_fea, batch[edge_index[0]])
+
         return edge_fea
 
 
 class Net(nn.Module):
     def __init__(self, num_species, irreps_embed_node, irreps_edge_init, irreps_sh, irreps_mid_node, 
                  irreps_post_node, irreps_out_node,irreps_mid_edge, irreps_post_edge, irreps_out_edge, 
-                 num_block, use_sc, r_max, num_basis=32,
+                 num_block, r_max, use_sc=True, only_ij=False, num_basis=128,
                  act={1: torch.nn.functional.silu, -1: torch.tanh},
                  act_gates={1: torch.sigmoid, -1: torch.tanh},
                  if_sort_irreps=False):
         super(Net, self).__init__()
         self.num_species = num_species
+        self.only_ij = only_ij
         
         irreps_embed_node = Irreps(irreps_embed_node)
         assert irreps_embed_node == Irreps(f'{irreps_embed_node.dim}x0e')
         self.embedding = Linear(irreps_in=f"{num_species}x0e", irreps_out=irreps_embed_node)
 
         # edge embedding for tensor product weight
-        self.basis = BesselBasis(r_max, num_basis=num_basis, trainable=True)
-        self.cutoff = PolynomialCutoff(r_max, p=6)
+        # self.basis = BesselBasis(r_max, num_basis=num_basis, trainable=True)
+        # self.cutoff = PolynomialCutoff(r_max, p=6)
+        self.basis = GaussianBasis(start=0.0, stop=r_max, n_gaussians=num_basis, trainable=False)
         
         # distance expansion to initialize edge feature
         irreps_edge_init = Irreps(irreps_edge_init)
@@ -232,6 +314,7 @@ class Net(nn.Module):
             start=0.0, stop=6.0, n_gaussians=irreps_edge_init.dim, trainable=False
         )
 
+        self.irreps_sh = irreps_sh
         self.sh = SphericalHarmonics(
             irreps_out=irreps_sh,
             normalize=True,
@@ -246,34 +329,64 @@ class Net(nn.Module):
         self.edge_update_blocks = nn.ModuleList([])
         for index_block in range(num_block):
             if index_block == num_block - 1:
-                node_update_block = NodeUpdateBlock(num_basis, irreps_sh, irreps_node_prev, irreps_post_node, irreps_edge_prev, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
-                edge_update_block = EdgeUpdateBlock(num_basis, irreps_sh, node_update_block.irreps_out, irreps_edge_prev, irreps_post_edge, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
+                node_update_block = NodeUpdateBlock(num_species, num_basis, irreps_sh, irreps_node_prev, irreps_post_node, irreps_edge_prev, act, act_gates, use_sc, only_ij=only_ij, if_sort_irreps=if_sort_irreps)
+                edge_update_block = EdgeUpdateBlock(num_species, num_basis, irreps_sh, node_update_block.irreps_out, irreps_edge_prev, irreps_post_edge, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
             else:
-                node_update_block = NodeUpdateBlock(num_basis, irreps_sh, irreps_node_prev, irreps_mid_node, irreps_edge_prev, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
-                edge_update_block = EdgeUpdateBlock(num_basis, irreps_sh, node_update_block.irreps_out, irreps_edge_prev, irreps_mid_edge, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
+                node_update_block = NodeUpdateBlock(num_species, num_basis, irreps_sh, irreps_node_prev, irreps_mid_node, irreps_edge_prev, act, act_gates, use_sc, only_ij=only_ij, if_sort_irreps=if_sort_irreps)
+                edge_update_block = EdgeUpdateBlock(num_species, num_basis, irreps_sh, node_update_block.irreps_out, irreps_edge_prev, irreps_mid_edge, act, act_gates, use_sc, if_sort_irreps=if_sort_irreps)
             irreps_node_prev = node_update_block.irreps_out
             irreps_edge_prev = edge_update_block.irreps_out
             self.node_update_blocks.append(node_update_block)
             self.edge_update_blocks.append(edge_update_block)
+        
+        for _, ir in Irreps(irreps_out_edge):
+            assert ir in irreps_edge_prev, f'required ir {ir} cannot be produced by convolution'
 
-        self.lin_node = Linear(irreps_in=irreps_post_node, irreps_out=irreps_out_node)
-        self.lin_edge = Linear(irreps_in=irreps_post_edge, irreps_out=irreps_out_edge)
+        self.irreps_out_node = irreps_out_node
+        self.irreps_out_edge = irreps_out_edge
+        self.lin_node = Linear(irreps_in=irreps_node_prev, irreps_out=irreps_out_node)
+        self.lin_edge = Linear(irreps_in=irreps_edge_prev, irreps_out=irreps_out_edge)
 
     def forward(self, data):
-        node_fea = F.one_hot(data.x, num_classes=self.num_species).type(torch.get_default_dtype())
-        node_fea = self.embedding(node_fea)
+        node_one_hot = F.one_hot(data.x, num_classes=self.num_species).type(torch.get_default_dtype())
+        edge_one_hot = F.one_hot(self.num_species * data.x[data.edge_index[0]] + data.x[data.edge_index[1]],
+                                 num_classes=self.num_species**2).type(torch.get_default_dtype()) # ! might not be good if dataset has many elements
+        
+        node_fea = self.embedding(node_one_hot)
 
         edge_vec = data["edge_attr"][:, [2, 3, 1]] # (y, z, x) order
 
         edge_sh = self.sh(edge_vec).type(torch.get_default_dtype())
-        edge_length_embedded = (self.basis(data["edge_attr"][:, 0] + epsilon) * self.cutoff(data["edge_attr"][:, 0])[:, None]).type(torch.get_default_dtype())
+        # edge_length_embedded = (self.basis(data["edge_attr"][:, 0] + epsilon) * self.cutoff(data["edge_attr"][:, 0])[:, None]).type(torch.get_default_dtype())
+        edge_length_embedded = self.basis(data['edge_attr'][:, 0])
+        
+        selfloop_edge = None
+        if self.only_ij:
+            selfloop_edge = torch.abs(data["edge_attr"][:, 0]) < 1e-7
 
         # edge_fea = self.edge_update_block_init(node_fea, edge_sh, None, edge_length_embedded, data["edge_index"])
         edge_fea = self.distance_expansion(data['edge_attr'][:, 0]).type(torch.get_default_dtype())
+        # for edge_fea_sing, distance_sing in zip(edge_fea, data['edge_attr'][:, 0]):
+        #     print(distance_sing)
+        #     print(edge_fea_sing)
+        # exit()
         for node_update_block, edge_update_block in zip(self.node_update_blocks, self.edge_update_blocks):
-            node_fea = node_update_block(node_fea, edge_sh, edge_fea, edge_length_embedded, data["edge_index"])
-            edge_fea = edge_update_block(node_fea, edge_sh, edge_fea, edge_length_embedded, data["edge_index"])
+            node_fea = node_update_block(node_fea, node_one_hot, edge_sh, edge_fea, edge_length_embedded, data["edge_index"], data.batch, selfloop_edge)
+            edge_fea = edge_update_block(node_fea, edge_one_hot, edge_sh, edge_fea, edge_length_embedded, data["edge_index"], data.batch)
 
         node_fea = self.lin_node(node_fea)
         edge_fea = self.lin_edge(edge_fea)
         return node_fea, edge_fea
+
+    def __repr__(self):
+        info = '===== e3Aij model structure: ====='
+        info += f'\nusing spherical harmonics: {self.irreps_sh}'
+        for index, (nupd, eupd) in enumerate(zip(self.node_update_blocks, self.edge_update_blocks)):
+            info += f'\n=== layer {index} ==='
+            info += f'\nnode update: ({nupd.irreps_in_node} -> {nupd.irreps_out})'
+            info += f'\nedge update: ({eupd.irreps_in_edge} -> {eupd.irreps_out})'
+        info += '\n=== output info ==='
+        info += f'\noutput node: ({self.irreps_out_node})'
+        info += f'\noutput edge: ({self.irreps_out_edge})'
+        
+        return info
