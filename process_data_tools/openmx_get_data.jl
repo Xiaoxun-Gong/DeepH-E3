@@ -14,16 +14,26 @@ function parse_commandline()
             arg_type = String
             default = "raw/openmx_test_inversion"
         "--output_dir", "-o"
-            help = "path of output openmx.Band"
+            help = ""
             arg_type = String
             default = "processed/openmx_test_inversion"
+        "--if_DM", "-d"
+            help = ""
+            arg_type = Bool
+            default = false
+        "--if_OLP", "-l"
+            help = ""
+            arg_type = Bool
+            default = false
     end
     return parse_args(s)
 end
 parsed_args = parse_commandline()
 
-periodic_table = JSON.parsefile("periodic_table.json")
+@info string("get data from: ", parsed_args["input_dir"])
+periodic_table = JSON.parsefile(joinpath(@__DIR__, "periodic_table.json"))
 
+#=
 struct Site_list
     R::Array{StaticArrays.SArray{Tuple{3},Int16,1,3},1}
     site::Array{Int64,1}
@@ -88,6 +98,23 @@ function _get_local_coordinate(e_ij::Array{Float64,1},site_list_i::Site_list)
     local_coordinate[:,3] = cross(local_coordinate[:,1],local_coordinate[:,2])
     return local_coordinate
 end
+
+function get_local_coordinates(site_positions::Matrix{<:Real}, lat::Matrix{<:Real}, R_list::Vector{SVector{3, Int64}}, Rcut::Float64)::Dict{Array{Int64,1},Array{Float64,2}}
+    nsites = size(site_positions, 2)
+    neighbour_site = cal_neighbour_site(site_positions, lat, R_list, nsites, Rcut)
+    local_coordinates = Dict{Array{Int64,1},Array{Float64,2}}()
+    for site_i = 1:nsites
+        site_list_i = neighbour_site[site_i]
+        nsites_i = length(site_list_i.R)
+        for j = 1:nsites_i
+            R = site_list_i.R[j]; site_j = site_list_i.site[j]; e_ij = site_list_i.pos[:,j]
+            local_coordinate = _get_local_coordinate(e_ij, site_list_i)
+            local_coordinates[cat(dims=1, R, site_i, site_j)] = local_coordinate
+        end
+    end
+    return local_coordinates
+end
+=#
 
 # come from Hop.jl
 function parse_openmx(filepath::String; return_DM::Bool = false)
@@ -215,7 +242,7 @@ function parse_openmx(filepath::String; return_DM::Bool = false)
         end
     end
 
-    @info """get orbital setting of element:orbital_types_element::Dict{String,Array{Int64,1}} "element" => orbital_types"""
+#     @info """get orbital setting of element:orbital_types_element::Dict{String,Array{Int64,1}} "element" => orbital_types"""
     find_target_line("<Definition.of.Atomic.Species")
     orbital_types_element = Dict{String,Array{Int64,1}}([])
     while true
@@ -229,7 +256,7 @@ function parse_openmx(filepath::String; return_DM::Bool = false)
     end
 
     
-    @info "get Chemical potential(Hartree)"
+#     @info "get Chemical potential (Hartree)"
     find_target_line("(see also PRB 72, 045121(2005) for the energy contributions)")
     readline(f)
     readline(f)
@@ -239,9 +266,9 @@ function parse_openmx(filepath::String; return_DM::Bool = false)
     @assert "potential" == str[2]
     @assert "(Hartree)" == str[3]
     ev2Hartree = 0.036749308136649
-    fermi_level = parse(Float64, str[length(str)])/ev2Hartree
+    fermi_level = parse(Float64, str[length(str)])#/ev2Hartree
 
-    # @info "get Chemical potential(Hartree)"
+    # @info "get Chemical potential (Hartree)"
     # find_target_line("Eigenvalues (Hartree)")
     # for i = 1:2;@assert readline(f) == "***********************************************************";end
     # readline(f)
@@ -250,7 +277,7 @@ function parse_openmx(filepath::String; return_DM::Bool = false)
     # fermi_level = parse(Float64, str[length(str)])/ev2Hartree
     
 
-    @info "get Fractional coordinates & orbital types:"
+#     @info "get Fractional coordinates & orbital types:"
     find_target_line("Fractional coordinates of the final structure")
     target_line = Vector{UInt8}("Fractional coordinates of the final structure")
     for i = 1:2;@assert readline(f) == "***********************************************************";end
@@ -286,35 +313,19 @@ function parse_openmx(filepath::String; return_DM::Bool = false)
     if return_DM
         return element, atomnum, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, tv, Hk, iHk, OLP, OLP_r, orbital_types, fermi_level, atom_pos, DM
     else
-        return element, atomnum, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, tv, Hk, iHk, OLP, OLP_r, orbital_types, fermi_level, atom_pos
+        return element, atomnum, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, tv, Hk, iHk, OLP, OLP_r, orbital_types, fermi_level, atom_pos, nothing
     end
-end
-
-function get_local_coordinates(site_positions::Matrix{<:Real}, lat::Matrix{<:Real}, R_list::Vector{SVector{3, Int64}}, Rcut::Float64)::Dict{Array{Int64,1},Array{Float64,2}}
-    nsites = size(site_positions, 2)
-    neighbour_site = cal_neighbour_site(site_positions, lat, R_list, nsites, Rcut)
-    local_coordinates = Dict{Array{Int64,1},Array{Float64,2}}()
-    for site_i = 1:nsites
-        site_list_i = neighbour_site[site_i]
-        nsites_i = length(site_list_i.R)
-        for j = 1:nsites_i
-            R = site_list_i.R[j]; site_j = site_list_i.site[j]; e_ij = site_list_i.pos[:,j]
-            local_coordinate = _get_local_coordinate(e_ij, site_list_i)
-            local_coordinates[cat(dims=1, R, site_i, site_j)] = local_coordinate
-        end
-    end
-    return local_coordinates
 end
 
 function get_data(filepath_scfout::String, Rcut::Float64; if_DM::Bool = false)
-    element, nsites, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, lat, Hk, iHk, OLP, OLP_r, orbital_types, fermi_level, site_positions = parse_openmx(filepath_scfout)
+    element, nsites, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, lat, Hk, iHk, OLP, OLP_r, orbital_types, fermi_level, site_positions, DM = parse_openmx(filepath_scfout; return_DM=if_DM)
 
     for t in [Hk, iHk]
         if t != nothing
-            ((x)->((y)->((z)->z .*= 27.211399).(y)).(x)).(t) # Hartree to eV
+            ((x)->((y)->((z)->z .*= 27.2113845).(y)).(x)).(t) # Hartree to eV
         end
     end
-    fermi_level *= 27.211399 # Hartree to eV
+    fermi_level *= 27.2113845 # Hartree to eV
     site_positions .*= 0.529177249 # Bohr to Ang
     lat .*= 0.529177249 # Bohr to Ang
 
@@ -329,21 +340,25 @@ function get_data(filepath_scfout::String, Rcut::Float64; if_DM::Bool = false)
 
     # get neighbour_site
     nsites = size(site_positions, 2)
-    neighbour_site = cal_neighbour_site(site_positions, lat, R_list, nsites, Rcut)
-    local_coordinates = Dict{Array{Int64, 1}, Array{Float64, 2}}()
+    # neighbour_site = cal_neighbour_site(site_positions, lat, R_list, nsites, Rcut)
+    # local_coordinates = Dict{Array{Int64, 1}, Array{Float64, 2}}()
 
     # process hamiltonian
     norbits = sum(Total_NumOrbs)
+    overlaps = Dict{Array{Int64, 1}, Array{Float64, 2}}()
     if SpinP_switch == 0
         spinful = false
         hamiltonians = Dict{Array{Int64, 1}, Array{Float64, 2}}()
         if if_DM
             density_matrixs = Dict{Array{Int64, 1}, Array{Float64, 2}}()
+        else
+            density_matrixs = nothing
         end
     elseif SpinP_switch == 1
         error("Collinear spin is not supported currently")
     elseif SpinP_switch == 3
         @assert if_DM == false
+        density_matrixs = nothing
         spinful = true
         for i in 1:length(Hk[4]),j in 1:length(Hk[4][i])
             Hk[4][i][j] += iHk[3][i][j]
@@ -358,19 +373,22 @@ function get_data(filepath_scfout::String, Rcut::Float64; if_DM::Bool = false)
         site_j = natn[site_i][index_nn_i]
         R = atv_ijk[:, ncn[site_i][index_nn_i]]
         e_ij = lat * R + site_positions[:, site_j] - site_positions[:, site_i]
-        if norm(e_ij) > Rcut
-            continue
-        end
+        # if norm(e_ij) > Rcut
+            # continue
+        # end
         key = cat(dims=1, R, site_i, site_j)
-        site_list_i = neighbour_site[site_i]
-        local_coordinate = _get_local_coordinate(e_ij, site_list_i)
-        local_coordinates[key] = local_coordinate
-
+        # site_list_i = neighbour_site[site_i]
+        # local_coordinate = _get_local_coordinate(e_ij, site_list_i)
+        # local_coordinates[key] = local_coordinate
+        
+        overlap = permutedims(OLP[site_i][index_nn_i])
+        overlaps[key] = overlap
         if SpinP_switch == 0
             hamiltonian = permutedims(Hk[1][site_i][index_nn_i])
             hamiltonians[key] = hamiltonian
             if if_DM
                 density_matrix = permutedims(DM[1][site_i][index_nn_i])
+                density_matrixs[key] = density_matrix
             end
         elseif SpinP_switch == 1
             error("Collinear spin is not supported currently")
@@ -397,18 +415,29 @@ function get_data(filepath_scfout::String, Rcut::Float64; if_DM::Bool = false)
         end
     end
 
-    if if_DM
-        return element, density_matrixs, hamiltonians, local_coordinates, fermi_level, orbital_types, lat, site_positions, spinful
-    else
-        return element, hamiltonians, local_coordinates, fermi_level, orbital_types, lat, site_positions, spinful
-    end
+    return element, overlaps, density_matrixs, hamiltonians, fermi_level, orbital_types, lat, site_positions, spinful, R_list
 end
 
 parsed_args["input_dir"] = abspath(parsed_args["input_dir"])
 mkpath(parsed_args["output_dir"])
 cd(parsed_args["output_dir"])
 
-element, hamiltonians, local_coordinates, fermi_level, orbital_types, lat, site_positions, spinful = get_data(joinpath(parsed_args["input_dir"], "openmx.scfout"), 7.2)
+element, overlaps, density_matrixs, hamiltonians, fermi_level, orbital_types, lat, site_positions, spinful, R_list = get_data(joinpath(parsed_args["input_dir"], "openmx.scfout"), -1.0; if_DM=parsed_args["if_DM"])
+
+if parsed_args["if_DM"]
+    h5open("density_matrixs.h5", "w") do fid
+        for (key, density_matrix) in density_matrixs
+            write(fid, string(key), permutedims(density_matrix)) # npz似乎为julia专门做了个转置而h5没有做
+        end
+    end
+end
+if parsed_args["if_OLP"]
+    h5open("overlaps.h5", "w") do fid
+        for (key, overlap) in overlaps
+            write(fid, string(key), permutedims(overlap)) # npz似乎为julia专门做了个转置而h5没有做
+        end
+    end
+end
 h5open("hamiltonians.h5", "w") do fid
     for (key, hamiltonian) in hamiltonians
         write(fid, string(key), permutedims(hamiltonian)) # npz似乎为julia专门做了个转置而h5没有做
@@ -424,6 +453,9 @@ open("info.json", "w") do f
 end
 open("site_positions.dat", "w") do f
     writedlm(f, site_positions)
+end
+open("R_list.dat", "w") do f
+    writedlm(f, R_list)
 end
 open("lat.dat", "w") do f
     writedlm(f, lat)

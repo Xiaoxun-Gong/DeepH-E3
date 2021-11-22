@@ -10,6 +10,7 @@ import numpy as np
 import h5py
 
 from .from_pymatgen.lattice import find_neighbors, _one_to_three, _compute_cube_index, _three_to_one
+from .utils import flt2cplx
 
 
 class Collater:
@@ -64,6 +65,13 @@ def convert_ijji(edge_key):
     out = [- edge_key[0], -edge_key[1], -edge_key[2], edge_key[4], edge_key[3]]
     return out
 
+def get_edge_fea(cart_coords, lattice, default_dtype_torch, edge_key):
+    cart_coords_i = cart_coords[edge_key[:, 3] - 1]
+    cart_coords_j = cart_coords[edge_key[:, 4] - 1] + edge_key[:, :3].type(default_dtype_torch) @ lattice
+    dist = torch.linalg.vector_norm(cart_coords_j - cart_coords_i, dim=-1)
+    edge_fea = torch.cat([dist[:, None], (cart_coords_j - cart_coords_i)], dim=-1)
+    return edge_fea
+
 """
 The function get_graph below is extended from "https://github.com/materialsproject/pymatgen", which has the MIT License below
 
@@ -111,24 +119,28 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
                     if not is_ij(key):
                         continue
                 key = (key[0], key[1], key[2], key[3] - 1, key[4] - 1)
-                if spinful:
-                    num_orbital_row = atom_num_orbital[key[3]]
-                    num_orbital_column = atom_num_orbital[key[4]]
-                    # soc block order:
-                    # 1 3
-                    # 4 2
-                    Aij_value = torch.stack([
-                        torch.tensor(v[:num_orbital_row, :num_orbital_column].real, dtype=default_dtype_torch),
-                        torch.tensor(v[:num_orbital_row, :num_orbital_column].imag, dtype=default_dtype_torch),
-                        torch.tensor(v[num_orbital_row:, num_orbital_column:].real, dtype=default_dtype_torch),
-                        torch.tensor(v[num_orbital_row:, num_orbital_column:].imag, dtype=default_dtype_torch),
-                        torch.tensor(v[:num_orbital_row, num_orbital_column:].real, dtype=default_dtype_torch),
-                        torch.tensor(v[:num_orbital_row, num_orbital_column:].imag, dtype=default_dtype_torch),
-                        torch.tensor(v[num_orbital_row:, :num_orbital_column].real, dtype=default_dtype_torch),
-                        torch.tensor(v[num_orbital_row:, :num_orbital_column].imag, dtype=default_dtype_torch)
-                    ], dim=-1)
+                # if spinful:
+                #     num_orbital_row = atom_num_orbital[key[3]]
+                #     num_orbital_column = atom_num_orbital[key[4]]
+                #     # soc block order:
+                #     # 1 3
+                #     # 4 2
+                #     Aij_value = torch.stack([
+                #         torch.tensor(v[:num_orbital_row, :num_orbital_column].real, dtype=default_dtype_torch),
+                #         torch.tensor(v[:num_orbital_row, :num_orbital_column].imag, dtype=default_dtype_torch),
+                #         torch.tensor(v[num_orbital_row:, num_orbital_column:].real, dtype=default_dtype_torch),
+                #         torch.tensor(v[num_orbital_row:, num_orbital_column:].imag, dtype=default_dtype_torch),
+                #         torch.tensor(v[:num_orbital_row, num_orbital_column:].real, dtype=default_dtype_torch),
+                #         torch.tensor(v[:num_orbital_row, num_orbital_column:].imag, dtype=default_dtype_torch),
+                #         torch.tensor(v[num_orbital_row:, :num_orbital_column].real, dtype=default_dtype_torch),
+                #         torch.tensor(v[num_orbital_row:, :num_orbital_column].imag, dtype=default_dtype_torch)
+                #     ], dim=-1)
 
-                    Aij_dict[key] = Aij_value
+                #     Aij_dict[key] = Aij_value
+                # else:
+                #     Aij_dict[key] = torch.tensor(v, dtype=default_dtype_torch)
+                if spinful:
+                    Aij_dict[key] = torch.tensor(v, dtype=flt2cplx(default_dtype_torch))
                 else:
                     Aij_dict[key] = torch.tensor(v, dtype=default_dtype_torch)
             fid.close()
@@ -138,9 +150,9 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
         assert max_num_nbr == 0
         # TODO from overlaps
         key_atom_list = [[] for _ in range(len(numbers))]
-        edge_idx, edge_fea, edge_idx_first, key_list = [], [], [], []
+        edge_idx, edge_idx_first, key_list = [], [], []
         fid = h5py.File(os.path.join(data_folder, target_file_name), 'r') 
-        for k, v in fid.items():
+        for k in fid.keys():
             key = eval(k)
             if only_ij:
                 if not is_ij(key):
@@ -155,21 +167,15 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
 
         for index_first, (cart_coord, keys_tensor) in enumerate(zip(cart_coords, key_atom_list)):
             keys_tensor = torch.stack(keys_tensor)
-            cart_coords_j = cart_coords[keys_tensor[:, 4] - 1] + keys_tensor[:, :3].type(default_dtype_torch) @ lattice
-            dist = torch.norm(cart_coords_j - cart_coord[None, :], dim=1)
             len_nn = keys_tensor.shape[0]
             edge_idx_first.extend([index_first] * len_nn)
             edge_idx.extend((keys_tensor[:, 4] - 1).tolist())
-
-            edge_fea_single = torch.cat([dist.view(-1, 1), (cart_coords_j - cart_coord[None, :])], dim=-1)
-            edge_fea.append(edge_fea_single)
-            
             key_list.append(keys_tensor)
 
-        edge_fea = torch.cat(edge_fea).type(default_dtype_torch)
         edge_idx = torch.stack([torch.LongTensor(edge_idx_first), torch.LongTensor(edge_idx)])
-        
         edge_key = torch.cat(key_list)
+        
+        edge_fea = get_edge_fea(cart_coords, lattice, default_dtype_torch, edge_key)
         
     else:
         cart_coords_np = cart_coords.detach().numpy()
@@ -301,8 +307,10 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
                 Aij_mask = torch.zeros(edge_fea.shape[0], dtype=torch.bool)  # Aij_mask[i]代表第 i 个边是否计算了hopping等
                 # TODO 没有处理数据集包括不同元素组成的情况
                 if spinful:
-                    Aij = torch.full([edge_fea.shape[0], max_num_orbital, max_num_orbital, 8], np.nan,
-                                     dtype=default_dtype_torch)
+                    # Aij = torch.full([edge_fea.shape[0], max_num_orbital, max_num_orbital, 8], np.nan,
+                    #                  dtype=default_dtype_torch)
+                    Aij = torch.full([edge_fea.shape[0], max_num_orbital * 2, max_num_orbital * 2], np.nan,
+                                     dtype=flt2cplx(default_dtype_torch))
                 else:
                     Aij = torch.full([edge_fea.shape[0], max_num_orbital, max_num_orbital], np.nan,
                                      dtype=default_dtype_torch)
@@ -316,7 +324,7 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
                     if key in Aij_dict:
                         Aij_mask[index] = True
                         if spinful:
-                            Aij[index, :atom_num_orbital[i], :atom_num_orbital[j], :] = Aij_dict[key]
+                            Aij[index, :atom_num_orbital[i] * 2, :atom_num_orbital[j] * 2] = Aij_dict[key]
                         else:
                             Aij[index, :atom_num_orbital[i], :atom_num_orbital[j]] = Aij_dict[key]
                     else:
