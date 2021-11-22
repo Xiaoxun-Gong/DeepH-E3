@@ -1,14 +1,27 @@
+from math import sqrt
+
 import torch
 from torch import nn
+from torch._C import dtype
+import torch.nn.functional as F
 from torch_scatter import scatter
+from torch_geometric.utils import degree
 
-from e3nn.o3 import Irrep, Irreps, wigner_3j
+from e3nn.o3 import Irrep, Irreps, wigner_3j, matrix_to_angles, Linear, FullyConnectedTensorProduct
 from e3nn.nn import Extract
+from .utils import flt2cplx, irreps_from_l1l2
 
 
 class Rotate:
-    def __init__(self, default_dtype_torch, device_torch='cpu'):
+    def __init__(self, default_dtype_torch, device_torch='cpu', spinful=False):
         sqrt_2 = 1.4142135623730951
+            
+        self.spinful = spinful
+        if spinful:
+            assert default_dtype_torch in [torch.complex64, torch.complex128]
+        else:
+            assert default_dtype_torch in [torch.float32, torch.float64]
+        
         # openmx的实球谐函数基组变复球谐函数
         self.Us_openmx = {
             0: torch.tensor([1], dtype=torch.cfloat, device=device_torch),
@@ -34,6 +47,12 @@ class Rotate:
             3: torch.eye(7, dtype=default_dtype_torch)[[6, 4, 2, 0, 1, 3, 5]].to(device=device_torch)
         }
         self.Us_wiki2openmx = {k: v.T for k, v in self.Us_openmx2wiki.items()}
+        if spinful:
+            self.Us_openmx2wiki_sp = {}
+            for k, v in self.Us_openmx2wiki.items():
+                self.Us_openmx2wiki_sp[k] = torch.block_diag(v, v)
+        
+        self.dtype = default_dtype_torch 
 
     def rotate_e3nn_v(self, v, R, l, order_xyz=True):
         if order_xyz:
@@ -44,6 +63,9 @@ class Rotate:
             # R是(y, z, x)顺序
             R_e3nn = R
         return v @ Irrep(l, 1).D_from_matrix(R_e3nn)
+    # 注: 在e3nn的规范中, 旋转矩阵是作用在向量左边的. 
+    # 但是这里旋转矩阵默认是作用在向量右边的, 这是为了方便处理向量开头可能还有的额外维度.
+    # 解决这个问题很容易, 只要让输入到这里的矩阵R是作用在向量右边的就可以. 因为R转置后, 输出的D也恰好被转置.
 
     def rotate_openmx_H(self, H, R, l_left, l_right, order_xyz=True):
         if order_xyz:
@@ -57,6 +79,7 @@ class Rotate:
                @ self.Us_openmx2wiki[l_right].T @ Irrep(l_right, 1).D_from_matrix(R_e3nn) @ self.Us_openmx2wiki[l_right]
     
     def rotate_openmx_H_full(self, H, R, orbital_types_left, orbital_types_right, order_xyz=True):
+        assert len(R.shape) == 2 # TODO: does not support batch operation
         if order_xyz:
             # R是(x, y, z)顺序
             R_e3nn = self.rotate_matrix_convert(R)
@@ -66,10 +89,17 @@ class Rotate:
             R_e3nn = R
         irreps_left = Irreps([(1, (l, (- 1) ** l)) for l in orbital_types_left])
         irreps_right = Irreps([(1, (l, (- 1) ** l)) for l in orbital_types_right])
+        U_left = irreps_left.D_from_matrix(R_e3nn)
+        U_right = irreps_right.D_from_matrix(R_e3nn)
         openmx2wiki_left = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_left])
         openmx2wiki_right = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_right])
-        return openmx2wiki_left.T @ irreps_left.D_from_matrix(R_e3nn).transpose(-1, -2) @ openmx2wiki_left @ H \
-               @ openmx2wiki_right.T @ irreps_right.D_from_matrix(R_e3nn) @ openmx2wiki_right
+        if self.spinful:
+            U_left = torch.kron(self.D_one_half(R_e3nn), U_left)
+            U_right = torch.kron(self.D_one_half(R_e3nn), U_right)
+            openmx2wiki_left = torch.block_diag(openmx2wiki_left, openmx2wiki_left)
+            openmx2wiki_right = torch.block_diag(openmx2wiki_right, openmx2wiki_right)
+        return openmx2wiki_left.T @ U_left.transpose(-1, -2).conj() @ openmx2wiki_left @ H \
+               @ openmx2wiki_right.T @ U_right @ openmx2wiki_right
 
     def wiki2openmx_H(self, H, l_left, l_right):
         return self.Us_openmx2wiki[l_left].T @ H @ self.Us_openmx2wiki[l_right]
@@ -80,6 +110,30 @@ class Rotate:
     def rotate_matrix_convert(self, R):
         # (x, y, z)顺序排列的旋转矩阵转换为(y, z, x)顺序(see e3nn.o3.spherical_harmonics() and https://docs.e3nn.org/en/stable/guide/change_of_basis.html)
         return torch.eye(3)[[1, 2, 0]] @ R @ torch.eye(3)[[1, 2, 0]].T # todo: cuda
+    
+    def D_one_half(self, R):
+        # 输入到这个函数的R应为y,z,x顺序
+        # 这里没有考虑空间反演, 即假设l=1/2的不等价不可约表示带有偶宇称
+        assert self.spinful
+        d = torch.det(R).sign()
+        R = d[..., None, None] * R
+        k = (1 - d) / 2 # parity index
+        alpha, beta, gamma = matrix_to_angles(R)
+        J = torch.tensor([[1, 1], [1j, -1j]], dtype=self.dtype) / 1.4142135623730951 # <1/2 mz|1/2 my>
+        Uz1 = self._sp_z_rot(alpha)
+        Uy = J @ self._sp_z_rot(beta) @ J.T.conj()
+        Uz2 = self._sp_z_rot(gamma)
+        return Uz1 @ Uy @ Uz2
+        # return torch.eye(2, dtype=self.dtype)
+    
+    def _sp_z_rot(self, angle):
+        # [[e^{-ia/2}, 0], [0, e^{ia/2}]]
+        assert self.spinful
+        M = torch.zeros([*angle.shape, 2, 2], dtype=self.dtype)
+        inds = torch.tensor([0, 1])
+        freqs = torch.tensor([0.5, -0.5], dtype=self.dtype)
+        M[..., inds, inds] = torch.exp(- freqs * (1j) * angle[..., None])
+        return M
 
 
 class sort_irreps(torch.nn.Module):
@@ -87,121 +141,230 @@ class sort_irreps(torch.nn.Module):
         super().__init__()
         irreps_in = Irreps(irreps_in)
         sorted_irreps = irreps_in.sort()
+        
         irreps_out_list = [((mul, ir),) for mul, ir in sorted_irreps.irreps]
         instructions = [(i,) for i in sorted_irreps.inv]
         self.extr = Extract(irreps_in, irreps_out_list, instructions)
         
+        irreps_in_list = [((mul, ir),) for mul, ir in irreps_in]
+        instructions_inv = [(i,) for i in sorted_irreps.p]
+        self.extr_inv = Extract(sorted_irreps.irreps, irreps_in_list, instructions_inv)
+        
         self.irreps_in = irreps_in
-        self.irreps_out = sorted_irreps.irreps
+        self.irreps_out = sorted_irreps.irreps.simplify()
     
     def forward(self, x):
+        r'''irreps_in -> irreps_out'''
         extracted = self.extr(x)
         return torch.cat(extracted, dim=-1)
 
-
-class construct_H:
-    def __init__(self, net_irreps_out, l1, l2):
-        net_irreps_out = Irreps(net_irreps_out)
-        
-        self.l1, self.l2 = l1, l2
-        
-        # # = check angular momentum quantum number =
-        # if l1 == l2:
-        #     assert len(net_irreps_out) == 1, 'It is recommended to combine the irreps together if the two output angular momentum quantum number are the same'
-        #     assert net_irreps_out[0].mul % 2 == 0
-        #     self.mul = net_irreps_out[0].mul // 2
-        # elif l1 * l2 == 0:
-        #     assert len(net_irreps_out) == 1, 'Only need one irrep if one angular momentum is 0'
-        #     assert net_irreps_out[0].mul == 1, 'Only need multiplicity one if one angular momentum is 0'
-        #     self.mul = 1
-        #     if l1 == 0:
-        #         assert net_irreps_out[0].ir.l == l2
-        #     elif l2 == 0:
-        #         assert net_irreps_out[0].ir.l == l1
-        # else:
-        #     assert net_irreps_out[0].ir.l == l1
-        #     assert net_irreps_out[1].ir.l == l2
-        #     assert net_irreps_out[0].mul == net_irreps_out[1].mul
-        #     self.mul = net_irreps_out[0].mul
-        #     # assert self.mul != 1, 'Too few multiplicities'
-               
-        # # = check parity
-        # for mul_ir in net_irreps_out:
-        #     assert mul_ir.ir.p == (- 1) ** mul_ir.ir.l
-        self.mul = 4 # ! temporary
-            
-        self.rotate_kernel = Rotate(torch.get_default_dtype())
-
-    def get_H(self, net_out):
-        r''' get openmx type H from net output '''
-        if self.l1 == 0:
-            H_pred = net_out.unsqueeze(-2)
-        elif self.l2 == 0:
-            H_pred = net_out.unsqueeze(-1)
-        else:
-            vec1 = net_out[:, :(self.mul * (2 * self.l1 + 1))].reshape(-1, self.mul, 2 * self.l1 + 1)
-            vec2 = net_out[:, (self.mul * (2 * self.l1 + 1)):].reshape(-1, self.mul, 2 * self.l2 + 1)
-            H_pred = torch.sum(vec1[:, :, :, None] * vec2[:, :, None, :], dim=-3)
-
-        H_pred = self.rotate_kernel.wiki2openmx_H(H_pred, self.l1, self.l2)
-        
-        return H_pred.reshape(net_out.shape[0], -1)
+    def inverse(self, x):
+        r'''irreps_out -> irreps_in'''
+        extracted_inv = self.extr_inv(x)
+        return torch.cat(extracted_inv, dim=-1)
 
 
 class e3TensorDecomp:
-    def __init__(self, net_irreps_out, out_js_list, default_dtype_torch, device_torch='cpu'):
+    def __init__(self, net_irreps_out, out_js_list, default_dtype_torch, spinful=False, if_sort=False, device_torch='cpu'):
+        if spinful:
+            default_dtype_torch = flt2cplx(default_dtype_torch)
         self.dtype = default_dtype_torch
+        self.spinful = spinful
+        
         self.device = device_torch
         self.out_js_list = out_js_list
-        net_irreps_out = Irreps(net_irreps_out)
+        if net_irreps_out is not None:
+            net_irreps_out = Irreps(net_irreps_out)
 
         required_irreps_out = Irreps(None)
         in_slices = [0]
-        out_slices = [0]
-        wigner_multipliers = []
+        wms = [] # wm = wigner_multiplier
+        H_slices = [0]
+        wms_H = []
+        if spinful:
+            in_slices_sp = []
+            H_slices_sp = []
+            wms_sp = []
+            wms_sp_H = []
+            
         for H_l1, H_l2 in out_js_list:
+            
             # = construct required_irreps_out =
-            p = (- 1) ** (H_l1 + H_l2) # required parity
-            required_ls = range(abs(H_l1 - H_l2), H_l1 + H_l2 + 1)
-            if len(net_irreps_out) < len(required_irreps_out) + 1:
-                raise ValueError('Net irreps out and target does not match')
-            mul = net_irreps_out[len(required_irreps_out)].mul
-            required_irreps_out += Irreps([(mul, (l, p)) for l in required_ls])
+            mul = 1
+            # if net_irreps_out is not None:
+            #     if len(net_irreps_out) < len(required_irreps_out) + 1:
+            #         raise ValueError('Net irreps out and target does not match')
+            #     mul = net_irreps_out[len(required_irreps_out)].mul
+            _, required_irreps_out_single, required_irreps_x1 = irreps_from_l1l2(H_l1, H_l2, mul, spinful)
+            required_irreps_out += required_irreps_out_single
+            
+            # spinful case, example: (1x0.5)x(2x0.5) = (1+2+3)x(0+1) = (1+2+3)+(0+1+2)+(1+2+3)+(2+3+4)
+            # everything on r.h.s. as a whole constitutes a slice in in_slices
+            # each bracket on r.h.s. above corresponds to a slice in in_slice_sp
+            if spinful:
+                in_slice_sp = [0, required_irreps_out_single.dim]
+                H_slice_sp = [0]
+                wm_sp = [None]
+                wm_sp_H = []
+                for (_a, ir), ir_times_1 in zip(required_irreps_out_single, required_irreps_x1):
+                    required_irreps_out += ir_times_1
+                    in_slice_sp.append(in_slice_sp[-1] + ir_times_1.dim)
+                    H_slice_sp.append(H_slice_sp[-1] + ir.dim)
+                    wm_irx1 = []
+                    wm_irx1_H = []
+                    for _b, ir_1 in ir_times_1:
+                        for _c in range(mul):
+                            wm_irx1.append(wigner_3j(ir.l, 1, ir_1.l, dtype=default_dtype_torch, device=device_torch))
+                            wm_irx1_H.append(wigner_3j(ir_1.l, ir.l, 1, dtype=default_dtype_torch, device=device_torch) * (2 * ir_1.l + 1))
+                            # wm_irx1.append(wigner_3j(ir.l, 1, ir_1.l, dtype=default_dtype_torch, device=device_torch) * sqrt(2 * ir_1.l + 1))
+                            # wm_irx1_H.append(wigner_3j(ir_1.l, ir.l, 1, dtype=default_dtype_torch, device=device_torch) * sqrt(2 * ir_1.l + 1))
+                    wm_irx1 = torch.cat(wm_irx1, dim=-1)
+                    wm_sp.append(wm_irx1)
+                    wm_irx1_H = torch.cat(wm_irx1_H, dim=0)
+                    wm_sp_H.append(wm_irx1_H)
             
             # = construct slices =
             in_slices.append(required_irreps_out.dim)
-            out_slices.append(out_slices[-1] + (2 * H_l1 + 1) * (2 * H_l2 + 1))
+            H_slices.append(H_slices[-1] + (2 * H_l1 + 1) * (2 * H_l2 + 1))
+            if spinful:
+                in_slices_sp.append(in_slice_sp)
+                H_slices_sp.append(H_slice_sp)
             
             # = get CG coefficients multiplier to act on net_out =
-            wigner_multiplier = []
-            for l in required_ls:
-                for i in range(mul):
-                    wigner_multiplier.append(wigner_3j(H_l1, H_l2, l, dtype=default_dtype_torch, device=device_torch))
-            wigner_multiplier = torch.cat(wigner_multiplier, dim=-1)
-            wigner_multipliers.append(wigner_multiplier)
-
+            wm = []
+            wm_H = []
+            for _a, ir in required_irreps_out_single:
+                for _b in range(mul):
+                    # about this 2l+1: 
+                    # we want the exact inverse of the w_3j symbol, i.e. torch.einsum("ijk,jkl->il",w_3j(l,l1,l2),w_3j(l1,l2,l))==torch.eye(...). but this is not the case, since the CG coefficients are unitary and w_3j differ from CG coefficients by a constant factor. but we know from https://en.wikipedia.org/wiki/3-j_symbol#Mathematical_relation_to_Clebsch%E2%80%93Gordan_coefficients that 2l+1 is exactly the factor we want.
+                    wm.append(wigner_3j(H_l1, H_l2, ir.l, dtype=default_dtype_torch, device=device_torch))
+                    wm_H.append(wigner_3j(ir.l, H_l1, H_l2, dtype=default_dtype_torch, device=device_torch) * (2 * ir.l + 1))
+                    # wm.append(wigner_3j(H_l1, H_l2, ir.l, dtype=default_dtype_torch, device=device_torch) * sqrt(2 * ir.l + 1))
+                    # wm_H.append(wigner_3j(ir.l, H_l1, H_l2, dtype=default_dtype_torch, device=device_torch) * sqrt(2 * ir.l + 1))
+            wm = torch.cat(wm, dim=-1)
+            wm_H = torch.cat(wm_H, dim=0)
+            wms.append(wm)
+            wms_H.append(wm_H)
+            if spinful:
+                wms_sp.append(wm_sp)
+                wms_sp_H.append(wm_sp_H)
+            
         # = check net irreps out =
-        assert net_irreps_out == required_irreps_out, f'requires {required_irreps_out} but got {net_irreps_out}'
+        if spinful:
+            required_irreps_out = required_irreps_out + required_irreps_out
+        if net_irreps_out is not None:
+            if if_sort:
+                assert net_irreps_out == required_irreps_out.sort().irreps.simplify(), f'requires {required_irreps_out.sort().irreps.simplify()} but got {net_irreps_out}'
+            else:
+                assert net_irreps_out == required_irreps_out, f'requires {required_irreps_out} but got {net_irreps_out}'
         
         self.in_slices = in_slices
-        self.out_slices = out_slices
-        self.wigner_multipliers = wigner_multipliers
+        self.wms = wms
+        self.H_slices = H_slices
+        self.wms_H = wms_H
+        if spinful:
+            self.in_slices_sp = in_slices_sp
+            self.H_slices_sp = H_slices_sp
+            self.wms_sp = wms_sp
+            self.wms_sp_H = wms_sp_H
 
         # = register rotate kernel =
-        self.rotate_kernel = Rotate(default_dtype_torch, device_torch)
+        self.rotate_kernel = Rotate(default_dtype_torch, spinful=spinful, device_torch=device_torch)
+        
+        if spinful:
+            sqrt2 = 1.4142135623730951
+                                            #  0,   y,   z,   x
+            # self.oyzx2spin = torch.tensor([[   0, -1, 1j,   0,  ],  # uu
+            #                                [   1,  0,  0,   1,  ],  # ud
+            #                                [  -1,  0,  0,   1,  ],  # du
+            #                                [   0,  1, 1j,   0,  ]], # dd
+            #                                dtype=default_dtype_torch) / sqrt2
+            self.oyzx2spin = torch.tensor([[  1,   0,   1,   0],
+                                           [  0, -1j,   0,   1],
+                                           [  0,  1j,   0,   1],
+                                           [  1,   0,  -1,   0]],
+                                            dtype=torch.complex64, device=device_torch) / sqrt2
+        
+        self.sort = None
+        if if_sort:
+            self.sort = sort_irreps(required_irreps_out)
+        
+        if self.sort is not None:
+            self.required_irreps_out = self.sort.irreps_out
+        else:
+            self.required_irreps_out = required_irreps_out
     
     def get_H(self, net_out):
         r''' get openmx type H from net output '''
-        out = torch.zeros(net_out.shape[0], self.out_slices[-1], dtype=self.dtype, device=self.device)
+        if self.sort is not None:
+            net_out = self.sort.inverse(net_out)
+        if self.spinful:
+            half_len = int(net_out.shape[-1] / 2)
+            re = net_out[:, :half_len]
+            im = net_out[:, half_len:]
+            net_out = re + 1j * im
+        out = []
         for i in range(len(self.out_js_list)):
             in_slice = slice(self.in_slices[i], self.in_slices[i + 1])
-            out_slice = slice(self.out_slices[i], self.out_slices[i + 1])
-            # H_block = torch.einsum('ijk,uk->uij', self.wigner_multiplier, net_out)
-            H_block = torch.sum(self.wigner_multipliers[i][None, :, :, :] * net_out[:, None, None, in_slice], dim=-1)
-            H_block = self.rotate_kernel.wiki2openmx_H(H_block, *self.out_js_list[i])
-            out[:, out_slice] = H_block.reshape(net_out.shape[0], -1)
+            net_out_block = net_out[:, in_slice]
+            if self.spinful:
+                # (1+2+3)+(0+1+2)+(1+2+3)+(2+3+4) -> (1+2+3)x(0+1)
+                H_block = []
+                for j in range(len(self.wms_sp[i])):
+                    in_slice_sp = slice(self.in_slices_sp[i][j], self.in_slices_sp[i][j + 1])
+                    if j == 0:
+                        H_block.append(net_out_block[:, in_slice_sp].unsqueeze(-1))
+                    else:
+                        H_block.append(torch.einsum('jkl,il->ijk', self.wms_sp[i][j], net_out_block[:, in_slice_sp]))
+                H_block = torch.cat([H_block[0], torch.cat(H_block[1:], dim=-2)], dim=-1)
+                # (1+2+3)x(0+1) -> (uu,ud,du,dd)x(1x2)
+                H_block = torch.einsum('imn,klm,jn->ijkl', H_block, self.wms[i], self.oyzx2spin)
+                H_block = self.rotate_kernel.wiki2openmx_H(H_block, *self.out_js_list[i])
+                out.append(H_block.reshape(net_out.shape[0], 4, -1))
+            else:
+                H_block = torch.sum(self.wms[i][None, :, :, :] * net_out_block[:, None, None, :], dim=-1)
+                H_block = self.rotate_kernel.wiki2openmx_H(H_block, *self.out_js_list[i])
+                out.append(H_block.reshape(net_out.shape[0], -1))
+        return torch.cat(out, dim=-1) # output shape: [edge, (4 spin components,) H_flattened_concatenated]
+
+    def get_net_out(self, H):
+        r'''get net output from openmx type H'''
+        out = []
+        for i in range(len(self.out_js_list)):
+            H_slice = slice(self.H_slices[i], self.H_slices[i + 1])
+            l1, l2 = self.out_js_list[i]
+            if self.spinful:
+                H_block = H[..., H_slice].reshape(-1, 4, 2 * l1 + 1, 2 * l2 + 1)
+                H_block = self.rotate_kernel.openmx2wiki_H(H_block, *self.out_js_list[i])
+                # (uu,ud,du,dd)x(1x2) -> (1+2+3)x(0+1)
+                H_block = torch.einsum('ilmn,jmn,kl->ijk', H_block, self.wms_H[i], self.oyzx2spin.T.conj())
+                # (1+2+3)x(0+1) -> (1+2+3)+(0+1+2)+(1+2+3)+(2+3+4)
+                net_out_block = [H_block[:, :, 0]]
+                for j in range(len(self.wms_sp_H[i])):
+                    H_slice_sp = slice(self.H_slices_sp[i][j], self.H_slices_sp[i][j + 1])
+                    net_out_block.append(torch.einsum('jlm,ilm->ij', self.wms_sp_H[i][j], H_block[:, H_slice_sp, 1:]))
+                net_out_block = torch.cat(net_out_block, dim=-1)
+                out.append(net_out_block)
+            else:
+                H_block = H[:, H_slice].reshape(-1, 2 * l1 + 1, 2 * l2 + 1)
+                H_block = self.rotate_kernel.openmx2wiki_H(H_block, *self.out_js_list[i])
+                net_out_block = torch.sum(self.wms_H[i][None, :, :, :] * H_block[:, None, :, :], dim=(-1, -2))
+                out.append(net_out_block)
+        out = torch.cat(out, dim=-1)
+        if self.spinful:
+            out = torch.cat([out.real, out.imag], dim=-1)
+        if self.sort is not None:
+            out = self.sort(out)
         return out
 
+    def convert_mask(self, mask):
+        assert self.spinful
+        num_edges = mask.shape[0]
+        mask = mask.permute(0, 2, 1).reshape(num_edges, -1).repeat(1, 2)
+        if self.sort is not None:
+            mask = self.sort(mask)
+        return mask
+        
 
 class e3LayerNorm(nn.Module):
     def __init__(self, irreps_in, eps=1e-5, affine=True, normalization='component', subtract_mean=True, divide_norm=False):
@@ -255,6 +418,7 @@ class e3LayerNorm(nn.Module):
         # from torch_geometric.nn.norm.LayerNorm
 
         batch_size = int(batch.max()) + 1 
+        batch_degree = degree(batch, batch_size, dtype=torch.int64).clamp_(min=1).to(dtype=x.dtype)
         
         out = []
         ix = 0
@@ -264,13 +428,13 @@ class e3LayerNorm(nn.Module):
             # compute and subtract mean
             if self.subtract_mean or ir.l == 0: # do not subtract mean for l>0 irreps if subtract_mean=False
                 mean = scatter(field, batch, dim=0, dim_size=batch_size,
-                            reduce='mean').mean(dim=1, keepdim=True)
+                            reduce='add').mean(dim=1, keepdim=True) / batch_degree[:, None, None] # scatter_mean does not support complex number
                 field = field - mean[batch]
                 
             # compute and divide norm
             if self.divide_norm or ir.l == 0: # do not divide norm for l>0 irreps if subtract_mean=False
-                norm = scatter(field.pow(2), batch, dim=0, dim_size=batch_size,
-                            reduce='mean').mean(dim=[1,2], keepdim=True)
+                norm = scatter(field.abs().pow(2), batch, dim=0, dim_size=batch_size,
+                            reduce='mean').mean(dim=[1,2], keepdim=True) # add abs here to deal with complex numbers
                 if self.normalization == 'norm':
                     norm = norm * ir.dim
                 field = field / (norm.sqrt()[batch] + self.eps)
@@ -318,3 +482,85 @@ class e3ElementWise:
             out.append(field)
         
         return torch.cat(out, dim=-1)
+
+
+# complex version of several modules
+
+class cplxE3Linear(Linear):
+    def __init__(self, *args, **kwargs):
+        is_complex = kwargs.pop('is_complex', False)
+        super().__init__(*args, **kwargs)
+        if is_complex:
+            assert self.internal_weights # only support internal_weights=True
+            self.weight = nn.Parameter(torch.randn(self.weight_numel, dtype=flt2cplx(torch.get_default_dtype()))) # TODO: initialization method
+
+class cplxFullyConnectedTensorProduct(FullyConnectedTensorProduct):
+    def __init__(self, *args, **kwargs):
+        is_complex = kwargs.pop('is_complex', False)
+        super().__init__(*args, **kwargs)
+        if is_complex:
+            assert self.internal_weights # only support internal_weights=True
+            self.weight = nn.Parameter(torch.randn(self.weight_numel, dtype=flt2cplx(torch.get_default_dtype())))
+            for attr in dir(self._compiled_main_out):
+                if attr[:4] == '_w3j':
+                    setattr(self._compiled_main_out, attr, 
+                            getattr(self._compiled_main_out, attr).type(flt2cplx(torch.get_default_dtype())))
+
+class cplxLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 device=None, dtype=None, is_complex=False) -> None:
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        if is_complex:
+            factory_kwargs = {'device': device, 'dtype': flt2cplx(torch.get_default_dtype())}
+            self.weight = nn.Parameter(torch.randn((out_features, in_features), **factory_kwargs)) # TODO complex initialization
+            if bias:
+                self.bias = nn.Parameter(torch.randn(out_features, **factory_kwargs))
+
+class modSiLU(nn.Module):
+    def __init__(self, input_size, eps=1e-5):
+        super().__init__()
+        self.bias = nn.Parameter(torch.normal(0.88, 0.5, input_size)) # randomly generated complex number has mean mod 0.88
+        self.eps = eps
+    
+    def forward(self, x):
+        mod = x.abs()
+        act_mod =F.silu(mod - self.bias)
+        return x * act_mod / (mod + self.eps)
+
+def CSiLU(x):
+    if x.dtype in [torch.float32, torch.float64]:
+        out = F.silu(x)
+    else:
+        out = F.silu(torch.real(x)) + 1j * F.silu(torch.imag(x))
+    return out
+
+class CSiLU_module(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return CSiLU(x)
+
+def CTanh(x):
+    if x.dtype in [torch.float32, torch.float64]:
+        out = torch.tanh(x)
+    else:
+        out = torch.tanh(torch.real(x)) + 1j * torch.tanh(torch.imag(x))
+    return out
+
+def CSigmoid(x):
+    if x.dtype in [torch.float32, torch.float64]:
+        out = torch.sigmoid(x)
+    else:
+        out = torch.sigmoid(torch.real(x)) + 1j * torch.sigmoid(torch.imag(x))
+    return out
+
+def get_complex_activation(act):
+    if act == F.silu:
+        act_out = CSiLU
+    elif act == torch.tanh:
+        act_out = CTanh
+    elif act == torch.sigmoid:
+        act_out = CSigmoid
+    else:
+        raise NotImplementedError(f'Cannot find the complex form of activation function {act}')
+    return act_out

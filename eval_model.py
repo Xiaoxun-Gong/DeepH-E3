@@ -7,14 +7,15 @@ import numpy as np
 import h5py
 
 import torch
-from torch.utils.data import SubsetRandomSampler, DataLoader
 from e3Aij import AijData, Collater
 from e3Aij.graph import convert_ijji
-from e3Aij.utils import TrainConfig, EvalConfig, process_targets
+from e3Aij.parse_configs import TrainConfig, EvalConfig
+from e3Aij.utils import process_targets, flt2cplx
 from e3Aij.e3modules import e3TensorDecomp
 
 parser = argparse.ArgumentParser(description='Evaluate trained e3Aij model')
 parser.add_argument('--config', type=str, help='Config file for evaluation')
+parser.add_argument('--debug', action='store_true', help='fill unpredicted matrix elements with 0')
 args = parser.parse_args()
 
 eval_config = EvalConfig(args.config)
@@ -38,6 +39,7 @@ dataset = AijData(
     only_ij=eval_config.only_ij,
     default_dtype_torch=torch.get_default_dtype()
 )
+spinful = dataset.info['spinful']
 collate = Collater(edge_Aij) # todo: multiple data
 atom_num_orbitals = [sum(map(lambda x: 2 * x + 1, atom_orbital_types)) for atom_orbital_types in dataset.info['orbital_types']]
 
@@ -66,9 +68,9 @@ for index_model, model_path in enumerate(model_path_list):
         warnings.warn(f'Model has cutoff radius r={train_config.cutoff_radius} but evaluation requires r={eval_config.cutoff_radius}')
     assert train_config.only_ij == eval_config.only_ij, f'evaluation uses {"un" if eval_config.only_ij else ""}directed graph but model does not'
     
-    train_config.set_target(dataset.info['orbital_types'], dataset.info['index_to_Z'], None)
+    train_config.set_target(dataset.info['orbital_types'], dataset.info['index_to_Z'], spinful, None)
     equivariant_blocks, out_js_list, out_slices = process_targets(dataset.info['orbital_types'], dataset.info['index_to_Z'], train_config.target_blocks)
-    construct_kernel = e3TensorDecomp(train_config.net_out_irreps, out_js_list, default_dtype_torch=torch.get_default_dtype(), device_torch=eval_config.device)
+    construct_kernel = e3TensorDecomp(train_config.net_out_irreps, out_js_list, default_dtype_torch=torch.get_default_dtype(), spinful=spinful, if_sort=train_config.convert_net_out, device_torch=eval_config.device)
     
     sys.path.append(os.path.join(model_path, 'src'))
     checkpoint = torch.load(os.path.join(model_path, 'best_model.pkl'))
@@ -85,12 +87,18 @@ for index_model, model_path in enumerate(model_path_list):
         batch = collate([data])
         with torch.no_grad():
             output, output_edge = net(batch.to(device=eval_config.device))
-            H_pred = construct_kernel.get_H(output_edge).detach().numpy() # .cpu()
+            H_pred = construct_kernel.get_H(output_edge).detach().cpu().numpy()
         for index_edge in range(batch.edge_index.shape[1]):
             key_term = str(batch.edge_key[index_edge].tolist())
             i, j = batch.x[batch.edge_index[:, index_edge]]
             if key_term not in H_pred_list[index_stru].keys():
-                H_pred_list[index_stru][key_term] = np.full((atom_num_orbitals[i], atom_num_orbitals[j]), np.nan, dtype=eval_config.np_dtype)
+                fill = 0 if args.debug else np.nan
+                fill_sp = 0 + 0j if args.debug else np.nan + np.nan * 1j
+                if spinful:
+                    init = np.full((atom_num_orbitals[i] * 2, atom_num_orbitals[j] * 2), fill_sp, dtype=flt2cplx(eval_config.np_dtype))
+                else:
+                    init = np.full((atom_num_orbitals[i], atom_num_orbitals[j]), fill, dtype=eval_config.np_dtype)
+                H_pred_list[index_stru][key_term] = init
             N_M_str_edge = f'{dataset.info["index_to_Z"][i].item()} {dataset.info["index_to_Z"][j].item()}'
             for index_target, equivariant_block in enumerate(equivariant_blocks):
                 for N_M_str, block_slice in equivariant_block.items():
@@ -100,17 +108,30 @@ for index_model, model_path in enumerate(model_path_list):
                         len_row = block_slice[1] - block_slice[0]
                         len_col = block_slice[3] - block_slice[2]
                         slice_out = slice(out_slices[index_target], out_slices[index_target + 1])
-                        H_pred_list[index_stru][key_term][slice_row, slice_col] = H_pred[index_edge, slice_out].reshape(len_row, len_col)
+                        if spinful:
+                            slice_row_ds = slice(atom_num_orbitals[i] + block_slice[0], atom_num_orbitals[i] + block_slice[1])
+                            slice_col_ds = slice(atom_num_orbitals[j] + block_slice[2], atom_num_orbitals[j] + block_slice[3])
+                            H_pred_list[index_stru][key_term][slice_row, slice_col] = H_pred[index_edge, 0, slice_out].reshape(len_row, len_col)
+                            H_pred_list[index_stru][key_term][slice_row, slice_col_ds] = H_pred[index_edge, 1, slice_out].reshape(len_row, len_col)
+                            H_pred_list[index_stru][key_term][slice_row_ds, slice_col] = H_pred[index_edge, 2, slice_out].reshape(len_row, len_col)
+                            H_pred_list[index_stru][key_term][slice_row_ds, slice_col_ds] = H_pred[index_edge, 3, slice_out].reshape(len_row, len_col)
+                        else:
+                            H_pred_list[index_stru][key_term][slice_row, slice_col] = H_pred[index_edge, slice_out].reshape(len_row, len_col)
                     
     print(f'Finished evaluating model {index_model} on all structures')
     
 print('\nFinished evaluating all models')
+if not args.debug:
+    for key_term, hopping in H_pred_list[index_stru].items():
+        assert np.all(np.isnan(hopping)==False), f'Some orbitals are not predicted. You can include option --debug to fill unpredicted matrix elements with 0.'
+
 # convert ijji
 if eval_config.only_ij:
     for index_stru in range(num_structure):
         H_dict_inv = {}
         for key_term, hopping in H_pred_list[index_stru].items():
-            assert np.all(np.isnan(hopping)==False), f'Some orbitals are not predicted'
+            # if not args.debug:
+            #     assert np.all(np.isnan(hopping)==False), f'Some orbitals are not predicted'
             key_inv = str(convert_ijji(key_term))
             if key_inv == key_term:
                 H_pred_list[index_stru][key_term] = (hopping + hopping.T) / 2.0
@@ -121,8 +142,9 @@ if eval_config.only_ij:
 
 print('\n------- Output -------')
 for H_dict, data in zip(H_pred_list, dataset):
-    print(f'Writing output to "{data.stru_id}_Hpred.h5"')
-    with h5py.File(os.path.join(eval_config.out_dir, f'{data.stru_id}_Hpred.h5'), 'w') as f:
+    os.makedirs(os.path.join(eval_config.out_dir, data.stru_id), exist_ok=True)
+    print(f'Writing output to "{data.stru_id}/hamiltonians_pred.h5"')
+    with h5py.File(os.path.join(eval_config.out_dir, f'{data.stru_id}/hamiltonians_pred.h5'), 'w') as f:
         for k, v in H_dict.items():
             f[k] = v
 
