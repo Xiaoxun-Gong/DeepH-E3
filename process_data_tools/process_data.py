@@ -1,5 +1,6 @@
 import os
 import argparse
+import warnings
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='Process data from openmx output.')
@@ -15,6 +16,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 # = find structures
 stru_path_list = []
+print(f'Looking for DFT calculated data under: {args.input_dir}')
 for root, dirs, files in os.walk(args.input_dir):
     if 'openmx.scfout' in files:
         stru_path_list.append(os.path.abspath(root))
@@ -29,6 +31,8 @@ stru_path_list_iter = tqdm(stru_path_list) if supress_output else stru_path_list
 for stru_input_path in stru_path_list_iter:
     relpath = os.path.split(stru_input_path)[-1]
     stru_output_path = os.path.join(args.output_dir, relpath)
+    if os.path.isdir(stru_output_path):
+        warnings.warn('Processed structures might be already existing under output_dir')
     os.makedirs(stru_output_path, exist_ok=True)
     # TODO might need modification
     cmd = f'julia openmx_get_data.jl --input_dir {stru_input_path} --output_dir {stru_output_path}' + \
@@ -36,3 +40,4 @@ for stru_input_path in stru_path_list_iter:
            (' > /dev/null 2>&1' if supress_output else '')
     return_code = os.system(cmd)
     assert return_code == 0, f'Error occured in executing command "{cmd}". Try not to include --simpout to see error messages.'
+print(f'All processed data successfully saved to {args.output_dir}')

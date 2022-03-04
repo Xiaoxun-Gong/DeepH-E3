@@ -5,10 +5,10 @@ import os
 
 
 rhp = h5py.File(
-    "/home/gongxx/projects/temp/hamiltonians_pred.h5",
+    "/home/gongxx/projects/DeepH/e3nn_DeepH/test_runs/0304_test_new_kernel/3xbi2se3/pred_result/t-1-2/hamiltonians_pred.h5",
     "r",
 )
-processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0218_bi2se3/moire/bi2se3_ab_novdw/1-2/processed_structure' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
+processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/test_runs/0304_test_new_kernel/3xbi2se3/pred_result/t-1-2/' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
 
 simplified_output = True
 

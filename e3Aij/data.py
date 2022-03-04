@@ -1,6 +1,7 @@
 from typing import Union, Dict, Tuple, List
 import os
 import time
+from click import option
 import tqdm
 
 from pymatgen.core.structure import Structure
@@ -52,21 +53,24 @@ raw_data_dir
         """
         self.raw_data_dir = raw_data_dir
         assert dataset_name.find('-') == -1, '"-" can not be included in the dataset name'
+        create_from_DFT = radius < 0
+        radius_info = 'rFromDFT' if create_from_DFT else f'{radius}r{max_num_nbr}mn'
         if target == 'hamiltonian':
-            graph_file_name = f'HGraph-{dataset_name}-{radius}r{max_num_nbr}mn-edge{"" if edge_Aij else "!"}=Aij{"-undrct" if only_ij else ""}.pkl' # undrct = undirected
+            graph_file_name = f'HGraph-{dataset_name}-{radius_info}-edge{"" if edge_Aij else "!"}=Aij{"-undrct" if only_ij else ""}.pkl' # undrct = undirected
         elif target == 'density_matrix':
-            graph_file_name = f'DMGraph-{dataset_name}-{radius}r{max_num_nbr}mn-{edge_Aij}edge{"-undrct" if only_ij else ""}.pkl'
+            graph_file_name = f'DMGraph-{dataset_name}-{radius_info}-{edge_Aij}edge{"-undrct" if only_ij else ""}.pkl'
         else:
             raise ValueError('Unknown prediction target: {}'.format(target))
         self.data_file = os.path.join(graph_dir, graph_file_name)
         os.makedirs(graph_dir, exist_ok=True)
         self.data, self.slices = None, None
         self.target = target
-        self.target_file_name = f'{self.target}s.h5'
+        self.target_file_name = 'overlaps.h5' if inference else f'{self.target}s.h5'
         self.dataset_name = dataset_name
         self.multiprocessing = multiprocessing
         self.radius = radius
         self.max_num_nbr = max_num_nbr
+        self.create_from_DFT = create_from_DFT
         self.edge_Aij = edge_Aij
         self.default_dtype_torch = default_dtype_torch
 
@@ -107,7 +111,10 @@ raw_data_dir
         else:
             raise ValueError(f'Cannot identify graph file {existing_graph_dir}')
         dataset_name = options[1]
-        cutoff_radius = float(options[2].split('r')[0])
+        if options[2] == 'rFromDFT':
+            cutoff_radius = -1
+        else:
+            cutoff_radius = float(options[2].split('r')[0])
         only_ij = options[-1] == 'undrct'
         return cls(
             raw_data_dir=None, 
@@ -138,14 +145,16 @@ raw_data_dir
         lattice = torch.tensor(structure.lattice.matrix, dtype=self.default_dtype_torch)
         return get_graph(cart_coords, frac_coords, numbers, stru_id, r=self.radius, max_num_nbr=self.max_num_nbr,
                          edge_Aij=self.edge_Aij, lattice=lattice, default_dtype_torch=self.default_dtype_torch,
-                         data_folder=folder, target_file_name=self.target_file_name, inference=self.inference, only_ij=self.only_ij, **kwargs)
+                         data_folder=folder, target_file_name=self.target_file_name, inference=self.inference, 
+                         only_ij=self.only_ij, create_from_DFT=self.create_from_DFT, **kwargs)
 
     def process(self):
         begin = time.time()
         folder_list = []
+        print(f'Looking for preprocessed data under: {self.raw_data_dir}')
         for root, dirs, files in os.walk(self.raw_data_dir):
             if {'element.dat', 'orbital_types.dat', 'info.json', 'lat.dat', 'site_positions.dat'}.issubset(files):
-                if self.inference == True or self.target_file_name in files:
+                if self.target_file_name in files:
                     folder_list.append(root)
         folder_list = folder_list[: self.nums]
         assert len(folder_list) != 0, "Can not find any structure"
@@ -189,7 +198,7 @@ raw_data_dir
 
     def set_mask(self, targets, convert_to_net=False):
         begin = time.time()
-        print("Setting mask for dataset...")
+        print("\nSetting mask for dataset...")
         
         spinful = self.info['spinful']
         
@@ -203,7 +212,6 @@ raw_data_dir
                 raise ValueError(f'Unsupported dtype: {dtype}')
         
         equivariant_blocks, out_js_list, out_slices = process_targets(self.info['orbital_types'], self.info["index_to_Z"], targets)
-        self.equivariant_blocks = equivariant_blocks
         if convert_to_net:
             construct_kernel = e3TensorDecomp(None, out_js_list, torch.get_default_dtype(), spinful=spinful, if_sort=True) # todo: dtype
         
@@ -227,7 +235,7 @@ raw_data_dir
             atomic_number_edge_i = data.x[data.edge_index[0]]
             atomic_number_edge_j = data.x[data.edge_index[1]]
 
-            for index_out, equivariant_block in enumerate(self.equivariant_blocks):
+            for index_out, equivariant_block in enumerate(equivariant_blocks):
                 for N_M_str, block_slice in equivariant_block.items():
                     condition_atomic_number_i, condition_atomic_number_j = map(lambda x: self.info["Z_to_index"][int(x)], N_M_str.split())
                     condition_slice_i = slice(block_slice[0], block_slice[1])

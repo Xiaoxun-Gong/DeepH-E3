@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import random
 
 import numpy as np
 import torch
@@ -9,6 +10,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from e3nn.o3 import Irreps
 
+def set_random_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
 
 class Logger(object):
     def __init__(self, filename):
@@ -61,6 +67,7 @@ class LossRecord:
         self.sum += val * num
         self.count += num
         self.avg = self.sum / self.count
+
 
 def flt2cplx(flt_dtype):
     if flt_dtype == torch.float32:
@@ -150,7 +157,10 @@ class RevertDecayLR:
             self.best_epoch = epoch
 
         # = save model =
-        self.save_model(epoch, val_loss, is_best=is_best)
+        try:
+            self.save_model(epoch, val_loss, is_best=is_best)
+        except KeyboardInterrupt:
+            print('Interrupting while saving model might cause the saved model to be deprecated')
 
     def revert(self):
         best_checkpoint = torch.load(os.path.join(self.save_model_dir, 'best_model.pkl'))
@@ -371,5 +381,6 @@ def orbital_analysis(atom_orbitals, required_block_type, spinful, targets=None, 
             print(net_out_irreps, file=v)
             print('\n------- Simplified net out irreps -------', file=v)
             print(net_out_irreps.sort()[0].simplify(), file=v)
+        print(f'\nAutomatically generated target and net_out_irreps. \nDetails saved to: {verbose}')
     
     return targets, net_out_irreps, net_out_irreps.sort()[0].simplify()
