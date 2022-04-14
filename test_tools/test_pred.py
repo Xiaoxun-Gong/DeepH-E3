@@ -5,12 +5,12 @@ import os
 
 
 rhp = h5py.File(
-    "/home/gongxx/projects/DeepH/e3nn_DeepH/test_runs/0304_test_new_kernel/3xbi2se3/pred_result/t-1-2/hamiltonians_pred.h5",
+    "/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0218_bi2se3/e3train/results/2022-03-14_14-10-14_testing/test/t-2-3/hamiltonians_pred.h5",
     "r",
 )
-processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/test_runs/0304_test_new_kernel/3xbi2se3/pred_result/t-1-2/' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
+processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0218_bi2se3/e3train/pred_twist/t-2-3' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
 
-simplified_output = True
+simplified_output = False
 
 rh = h5py.File(os.path.join(processed_structure, 'hamiltonians.h5'), "r")
 element = np.loadtxt(os.path.join(processed_structure, 'element.dat')).astype(int)

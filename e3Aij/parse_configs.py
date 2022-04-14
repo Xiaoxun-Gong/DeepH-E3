@@ -7,7 +7,7 @@ import torch
 
 from e3nn.o3 import Irreps
 
-from .utils import orbital_analysis
+from .utils import orbital_analysis, refine_post_node
 
 class BaseConfig:
     def __init__(self, config_file=None):
@@ -70,6 +70,7 @@ class TrainConfig(BaseConfig):
         self.get_train_section()
         
         if self.checkpoint_dir:
+            assert self.checkpoint_dir.endswith('.pkl'), 'checkpoint should point to model.pkl or best_model.pkl'
             config1_path = os.path.join(os.path.dirname(self.checkpoint_dir), 'src/train.ini')
             assert os.path.isfile(config1_path), 'cannot find train.ini under checkpoint dir'
             print(f'Overwriting sections [hyperparameters], [target] and [network] using train config in checkpoint: {config1_path}')
@@ -146,7 +147,7 @@ class TrainConfig(BaseConfig):
         irreps_mid = self._config.get('network', 'irreps_mid')
         if irreps_mid:
             self.irreps_mid_node = irreps_mid
-            self.irreps_post_node = irreps_mid
+            self._irreps_post_node = irreps_mid
             self.irreps_mid_edge = irreps_mid
         irreps_embed = self._config.get('network', 'irreps_embed')
         if irreps_embed:
@@ -157,7 +158,7 @@ class TrainConfig(BaseConfig):
         self.num_blocks = self._config.getint('network', 'num_blocks')
         
         # ! post edge
-        for name in ['irreps_embed_node', 'irreps_edge_init', 'irreps_mid_node', 'irreps_post_node', 'irreps_out_node', 'irreps_mid_edge']:
+        for name in ['irreps_embed_node', 'irreps_edge_init', 'irreps_mid_node', 'irreps_out_node', 'irreps_mid_edge']:
             irreps = self._config.get('network', name)
             if irreps:
                 delattr(self, name)
@@ -182,6 +183,17 @@ class TrainConfig(BaseConfig):
         if self.convert_net_out:
             self._net_out_irreps = Irreps(self._net_out_irreps).sort().irreps.simplify()
             
+        if spinful:
+            if_verbose = False
+            if output_file:
+                if_verbose = True
+            self._irreps_post_node = refine_post_node(irreps_post_node=self._irreps_post_node,
+                                                      irreps_mid_node=self.irreps_mid_node,
+                                                      irreps_mid_edge=self.irreps_mid_edge,
+                                                      irreps_sh=self.irreps_sh,
+                                                      irreps_post_edge=self._irreps_post_edge,
+                                                      if_verbose=if_verbose)
+            
         self._target_set_flag = True
     
     @property
@@ -198,6 +210,15 @@ class TrainConfig(BaseConfig):
     def irreps_post_edge(self):
         assert self._target_set_flag
         return self._irreps_post_edge
+    
+    @property
+    def irreps_post_node(self):
+        assert self._target_set_flag
+        ipn = self._config.get('network', 'irreps_post_node')
+        if ipn:
+            return ipn
+        else:
+            return self._irreps_post_node
     
             
 class EvalConfig(BaseConfig):
@@ -220,4 +241,5 @@ class EvalConfig(BaseConfig):
         self.out_dir = self._config.get('basic', 'output_dir')
         os.makedirs(self.out_dir, exist_ok=True)
         self.target = self._config.get('basic', 'target')
+        self.inference = self._config.getboolean('basic', 'inference')
         

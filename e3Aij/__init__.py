@@ -5,3 +5,4 @@ from .utils import LossRecord
 from .e3modules import Rotate, e3TensorDecomp
 
 from .kernel import e3AijKernel
+from .analyzer import testResultAnalyzer

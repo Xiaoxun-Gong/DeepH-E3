@@ -3,6 +3,8 @@ import os
 from os.path import dirname, abspath
 import sys
 import shutil
+import warnings
+from matplotlib.pyplot import axis, flag
 import numpy as np
 from collections import namedtuple
 import json
@@ -20,22 +22,115 @@ from .parse_configs import BaseConfig, TrainConfig, EvalConfig
 from .utils import Logger, RevertDecayLR, MaskMSELoss, LossRecord, process_targets, set_random_seed, flt2cplx
 from .e3modules import e3TensorDecomp
 
+# dataset_info_recorder = namedtuple('dataset_info', ['spinful', 'index_to_Z', 'orbital_types'])
+# net_out_info_recorder = namedtuple("net_out_info", ['blocks', 'js', 'slices'])
+train_info_recorder = namedtuple('train_info', ['epoch', 'global_step', 'lr', 'total_time', 'epoch_time', 'best_loss', 'train_losses', 'val_losses', 'val_loss_list', 'extra_val', 'extra_val_list', ])
+train_utils_recorder = namedtuple('train_utils', ['optimizer', 'tb_writer', 'loss_criterion'])
+
+
+class DatasetInfo:
+    
+    def __init__(self, spinful, index_to_Z, orbital_types):
+        
+        self.spinful = spinful
+        if isinstance(index_to_Z, list):
+            self.index_to_Z = torch.tensor(index_to_Z)
+        elif isinstance(index_to_Z, torch.Tensor):
+            self.index_to_Z = index_to_Z
+        else:
+            raise NotImplementedError
+        self.orbital_types = orbital_types
+        
+        self.Z_to_index = torch.full((100,), -1, dtype=torch.int64)
+        self.Z_to_index[self.index_to_Z] = torch.arange(len(index_to_Z))
+
+    @classmethod
+    def from_dataset(cls, dataset: AijData):
+        return cls(dataset.info['spinful'], dataset.info['index_to_Z'], dataset.info['orbital_types'])
+    
+    @classmethod
+    def from_json(cls, src_dir):
+        with open(os.path.join(src_dir, 'dataset_info.json'), 'r') as f:
+            info = json.load(f)
+        return cls(info['spinful'], info['index_to_Z'], info['orbital_types'])
+    
+    def save_json(self, src_dir):
+        with open(os.path.join(src_dir, 'dataset_info.json'), 'w') as f:
+            json.dump(dict(spinful=self.spinful, index_to_Z=self.index_to_Z.tolist(), orbital_types=self.orbital_types), f)
+    
+    def __eq__(self, __o) -> bool:
+        if __o.__class__ != __class__:
+            raise ValueError
+        a = __o.spinful == self.spinful
+        b = torch.all(__o.index_to_Z == self.index_to_Z)
+        c = __o.orbital_types == self.orbital_types
+        return a * b * c
+
+
+class NetOutInfo:
+    
+    def __init__(self, target_blocks, dataset_info: DatasetInfo):
+        self.target_blocks = target_blocks
+        self.dataset_info = dataset_info
+        self.blocks, self.js, self.slices = process_targets(dataset_info.orbital_types, 
+                                                            dataset_info.index_to_Z, 
+                                                            target_blocks)
+
+    def save_json(self, src_dir):
+        if os.path.isfile(os.path.join(src_dir, 'dataset_info.json')):
+            dataset_info_o = DatasetInfo.from_json(src_dir)
+            assert self.dataset_info == dataset_info_o
+        else:
+            self.dataset_info.save_json(src_dir)
+        with open(os.path.join(src_dir, 'target_blocks.json'), 'w') as f:
+            json.dump(self.target_blocks, f)
+    
+    @classmethod
+    def from_json(cls, src_dir):
+        dataset_info = DatasetInfo.from_json(src_dir)
+        with open(os.path.join(src_dir, 'target_blocks.json'), 'r') as f:
+            target_blocks = json.load(f)
+        return cls(target_blocks, dataset_info)
+    
+    def merge(self, other):
+        assert other.__class__ == __class__
+        assert self.dataset_info == other.dataset_info
+        self.target_blocks.extend(other.target_blocks)
+        self.blocks.extend(other.blocks)
+        self.js.extend(other.js)
+        length = self.slices.pop()
+        for i in other.slices:
+            self.slices.append(i + length)
+
+    def __eq__(self, __o) -> bool:
+        if __o.__class__ != __class__:
+            raise ValueError
+        flag = True
+        for k in self.__dict__.keys():
+            flag *= getattr(self, k) == getattr(__o, k)
+        return flag
+    
+    
 class e3AijKernel:
     
     def __init__(self):
         
+        # how to determine kernel mode:
+        # train mode: self.train_config is not None and self.eval_config is None
+        # eval mode: self.eval_config is not None
         self.train_config = None
         self.eval_config = None
         
         self.dataset = None
+        self.dataset_info = None
         self.net = None
         self.net_out_info = None
         self.construct_kernel = None
         
-        self.spinful = None
-        
         self.train_utils = None
         self.train_info = None
+        
+        torch.set_num_threads(8) # todo: put this into config
         
     def load_config(self, train_config_path=None, eval_config_path=None):
         if train_config_path is not None:
@@ -83,9 +178,8 @@ class e3AijKernel:
         # = prepare dataset =
         print('\n------- Preparation of training data -------')
         dataset = self.get_graph(config)
-        
-        # = register constructer (e3TensorDecomp) =
-        self.register_constructor()
+
+        self.config_set_target(verbose=os.path.join(config.save_dir, 'targets.txt'))
         
         # set dataset mask
         dataset.set_mask(config.target_blocks, convert_to_net=config.convert_net_out)
@@ -105,7 +199,14 @@ class e3AijKernel:
         model_parameters = filter(lambda p: p.requires_grad, net.parameters())
         params = sum([np.prod(p.size()) for p in model_parameters])
         print("The model you built has %d parameters." % params)
+
+        # = register constructer (e3TensorDecomp) =
+        self.register_constructor(device=config.device)
+        print('Output constructer associated to net.')
+
+        print()
         print(net)
+        # net.analyze_tp(os.path.join(config.save_dir, 'analyze_tp'))
         
         print('\n------- Preparation for training -------')
         # = select optimizer =
@@ -127,12 +228,13 @@ class e3AijKernel:
         # load from checkpoint
         if config.checkpoint_dir:
             print(f'Loading from checkpoint at {config.checkpoint_dir}')
-            checkpoint = torch.load(config.checkpoint_dir)
+            checkpoint = torch.load(config.checkpoint_dir, map_location='cpu')
             net.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             with open(os.path.join(config.save_dir, 'tensorboard/info.json'), 'r') as f:
                 global_step = json.load(f)['global_step'] + 1
+            best_loss = checkpoint['val_loss']
             # for param_group in optimizer.param_groups:
             #     param_group['lr'] = config.lr
             # scheduler.decay_epoch = config.revert_decay_epoch
@@ -141,16 +243,14 @@ class e3AijKernel:
         else:
             global_step = 0
             print('Starting new training process')
+            best_loss = 1e10
             
-        train_utils_recorder = namedtuple('train_utils', ['optimizer', 'tb_writer', 'loss_criterion'])
         self.train_utils = train_utils_recorder(optimizer, tb_writer, criterion)
-        train_info_recorder = namedtuple('train_info', ['epoch', 'global_step', 'lr', 'total_time', 'epoch_time', 'best_loss', 'train_losses', 'val_losses', 'val_loss_list', 'extra_val', 'extra_val_list', ])
             
         print('\n------- Begin training -------')
         # = train and validation =
         begin_time = time.time()
         epoch_begin_time = time.time()
-        best_loss = 1e10
         
         epoch = scheduler.next_epoch
         learning_rate = optimizer.param_groups[0]['lr']
@@ -195,9 +295,19 @@ class e3AijKernel:
                 global_step += 1
                 
         except KeyboardInterrupt:
-            print('\nTraining stopped due to KeyboardInterrupt')
-            
-        # test_losses, test_loss_list = self.get_loss(test_loader)
+            print('\nKeyboardInterrupt')
+
+        print('\nTraining finished.')
+
+        print('\n------- Testing network on test set -------')
+        with torch.no_grad():
+            test_losses, test_loss_list = self.get_loss(test_loader, save_h5=True)
+        print(f'Test loss: {test_losses.avg:.4e}')
+        print('Test results saved to "test_result.h5". It can be analyzed using "e3Aij-analyze".')
+        with open(os.path.join(config.save_dir, 'test_report.txt'), 'w') as f:
+            print(f'Test loss: {test_losses.avg:.4e}\n', file=f)
+            self.write_report(test_loss_list, file=f)
+        print('Test report written to: "test_report.txt".')
         
     def eval(self, config, debug=False):
         self.load_config(eval_config_path=config)
@@ -206,24 +316,40 @@ class e3AijKernel:
         torch.set_default_dtype(eval_config.torch_dtype)
         
         print('\n------- Preparation of graph data for evaluation -------')
-        dataset = self.get_graph(eval_config, inference=True)
+        dataset = self.get_graph(eval_config, inference=eval_config.inference)
         collate = Collater() # todo: multiple data
         
         H_pred_list = []
+        if not eval_config.inference:
+            net_out_combined = None
 
         print('\n------- Finding trained models -------')
         # get models
         model_path_list = self.find_model(eval_config.model_dir)
         
+        if not eval_config.inference:
+            h5file = os.path.join(eval_config.out_dir, 'test_result.h5')
+            assert not os.path.isfile(h5file)
+        
         print('\n------- Evaluating model -------')
         for index_model, model_path in enumerate(model_path_list):
             print(f'\nLoading model {index_model}:')
             self.load_config(train_config_path=os.path.join(model_path, 'src/train.ini'))
-            construct_kernel = self.register_constructor()
+            self.config_set_target()
+            if not eval_config.inference:
+                dataset.set_mask(self.train_config.target_blocks, del_Aij=False, convert_to_net=self.train_config.convert_net_out)
+            construct_kernel = self.register_constructor(device=eval_config.device)
             net: Net = self.load_model(os.path.join(model_path, 'src'), device=eval_config.device)
-            checkpoint = torch.load(os.path.join(model_path, 'best_model.pkl'))
+            checkpoint = torch.load(os.path.join(model_path, 'best_model.pkl'), map_location='cpu')
             net.load_state_dict(checkpoint['state_dict'])
             net.eval()
+            
+            if not eval_config.inference:
+                net_out_info = NetOutInfo.from_json(os.path.join(model_path, 'src'))
+                if net_out_combined is None:
+                    net_out_combined = net_out_info
+                else:
+                    net_out_combined.merge(net_out_info)
             
             with torch.no_grad():
                 for index_stru, data in enumerate(dataset):
@@ -232,8 +358,12 @@ class e3AijKernel:
                     print(f'Getting model {index_model} output on structure "{data.stru_id}"...')
                     batch = collate([data])
                     output, output_edge = net(batch.to(device=eval_config.device))
-                    H_pred = construct_kernel.get_H(output_edge).detach().cpu().numpy()
-                    self.update_hopping(H_pred_list[index_stru], batch, H_pred, debug=debug)
+                    H_pred = construct_kernel.get_H(output_edge).cpu()
+                    self.update_hopping(H_pred_list[index_stru], H_pred, batch.x, batch.edge_index, batch.edge_key, debug=debug)
+                    
+                    if not eval_config.inference:
+                        print(f'Saving model {index_model} output on structure "{data.stru_id}" to test_result.h5')
+                        self.save_test_result(batch, H_pred, h5file)
             
             print(f'Finished evaluating model {index_model} on all structures')
         
@@ -242,11 +372,18 @@ class e3AijKernel:
         if not debug:
             for hamiltonians in H_pred_list:
                 for key_term, hopping in hamiltonians.items():
-                    assert np.all(np.isnan(hopping)==False), f'Some orbitals are not predicted. You can include option --debug to fill unpredicted matrix elements with 0.'
+                    msg = f'Some orbitals are not predicted. You can include option --debug to fill unpredicted matrix elements with 0.'
+                    assert torch.all(torch.isnan(hopping)==False), msg
         
         # convert ijji
         if eval_config.only_ij:
             self.convert_ijji_hamiltonians(H_pred_list)
+            
+        if not eval_config.inference:
+            src = os.path.join(eval_config.out_dir, 'src')
+            os.makedirs(src, exist_ok=True)
+            net_out_combined.save_json(os.path.join(eval_config.out_dir, 'src'))
+            shutil.copyfile(self.train_config.config_file, os.path.join(src, 'train.ini'))
             
         print('\n------- Output -------')
         for H_dict, data in zip(H_pred_list, dataset):
@@ -256,7 +393,8 @@ class e3AijKernel:
                 for k, v in H_dict.items():
                     f[k] = v
         
-    def get_graph(self, config: BaseConfig, inference=False):
+    def get_graph(self, config: BaseConfig, inference=False): # todo: dataset info stored separately
+        process_only = config.__class__ == BaseConfig # isinstance(config, BaseConfig)
         # prepare graph data
         if config.graph_dir:
             dataset = AijData.from_existing_graph(config.graph_dir, torch.get_default_dtype())
@@ -279,25 +417,27 @@ class e3AijKernel:
                               inference=inference,
                               only_ij=False,
                               default_dtype_torch=torch.get_default_dtype(),
-                              load_graph=config.__class__!=BaseConfig)
-            
-        if self.train_config is not None:
-            assert self.train_config.target == dataset.target, 'Train target and dataset target does not match'
-        if self.eval_config is not None:
-            assert self.eval_config.target == dataset.target, 'Eval target and dataset target does not match'
+                              load_graph=not process_only) 
         
         self.dataset = dataset
-        if config.__class__ != BaseConfig:
-            self.spinful = dataset.info['spinful']
+        if not process_only:
+            # self.process_dataset_info()
+            # check target
+            if self.train_config is not None:
+                assert self.train_config.target == self.dataset.target, 'Train target and dataset target does not match'
+            if self.eval_config is not None:
+                assert self.eval_config.target == self.dataset.target, 'Eval target and dataset target does not match'
+            self.dataset_info = DatasetInfo.from_dataset(dataset)
             
         return dataset
     
     def build_model(self):
+        # it is recommended to use save_model first and load model from there, instead of using build_model
         assert self.train_config is not None
-        assert self.dataset is not None
+        assert self.dataset_info is not None
         config = self.train_config
         
-        num_species = len(self.dataset.info["index_to_Z"])
+        num_species = len(self.dataset_info.index_to_Z)
         print('Building model...')
         begin = time.time()
         net = Net(
@@ -325,11 +465,12 @@ class e3AijKernel:
     
     def save_model(self, src_path):
         assert self.train_config is not None
-        assert self.dataset is not None
+        assert self.dataset_info is not None
+        assert self.net_out_info is not None
         assert os.path.isdir(src_path)
         config = self.train_config
         
-        num_species = len(self.dataset.info["index_to_Z"])
+        num_species = len(self.dataset_info.index_to_Z)
         with open(os.path.join(src_path, 'build_model.py'), 'w') as f:
             pf = lambda x: print(x, file=f)
             pf(f"from e3Aij_1 import Net")
@@ -351,6 +492,8 @@ class e3AijKernel:
             pf(f"    spinful={False},")
             pf(f"    if_sort_irreps={False}")
             pf(f")")
+        
+        self.net_out_info.save_json(src_path)
     
     def load_model(self, src_path, device='cpu'):
         assert os.path.isdir(src_path)
@@ -360,40 +503,51 @@ class e3AijKernel:
         begin = time.time()
         from build_model import net
         print(f'Finished building model, cost {time.time() - begin:.2f} seconds.')
+        
+        sys.path.pop()
+        sys.modules.pop('build_model')
+        
         net.to(device)
         
         self.net = net
         
+        # load dataset_info and net_out_info
+        net_out_info_o = NetOutInfo.from_json(src_path)
+        if self.dataset_info is None:
+            self.dataset_info = net_out_info_o.dataset_info
+        else:
+            assert self.dataset_info == net_out_info_o.dataset_info
+        if self.net_out_info is None:
+            self.net_out_info = net_out_info_o
+        else:
+            assert self.net_out_info == net_out_info_o
+            
         return net
         
-    def register_constructor(self):
+    def register_constructor(self, device='cpu'):
+        # requires: dataset_info, train_config which target is already set
+        # returns: construct_kernel, net_out_info
         assert self.train_config is not None
-        assert self.dataset is not None
+        assert self.dataset_info is not None
         
-        dataset = self.dataset
         config = self.train_config
-        
-        o, i, s = dataset.info['orbital_types'], dataset.info['index_to_Z'], dataset.info['spinful']
-        verbose = ''
-        if self.eval_config is None:
-            verbose = os.path.join(config.save_dir, 'targets.txt')
-        self.train_config.set_target(o, i, s, verbose)
-        Ret = namedtuple("net_out_info", ['blocks', 'js', 'slices'])
-        self.net_out_info = Ret(*process_targets(o, i, self.train_config.target_blocks))
-        print('\nTargets in train config successfully processed.')
         
         construct_kernel = e3TensorDecomp(config.net_out_irreps, 
                                           self.net_out_info.js, 
                                           default_dtype_torch=torch.get_default_dtype(), 
-                                          spinful=dataset.info['spinful'], 
+                                          spinful=self.dataset_info.spinful, 
                                           if_sort=config.convert_net_out, 
-                                          device_torch=config.device)
-        print('Output constructer associated to net.')
+                                          device_torch=device)
         
         self.construct_kernel = construct_kernel
         
         return construct_kernel
     
+    def config_set_target(self, verbose=None):
+        o, i, s = self.dataset_info.orbital_types, self.dataset_info.index_to_Z, self.dataset_info.spinful# dataset.info['orbital_types'], dataset.info['index_to_Z'], dataset.info['spinful']
+        self.train_config.set_target(o, i, s, verbose)
+        self.net_out_info = NetOutInfo(self.train_config.target_blocks, self.dataset_info)
+
     @staticmethod
     def find_model(dir):
         model_path_list = []
@@ -406,7 +560,7 @@ class e3AijKernel:
             print(f'model {index_model}:', model_path)
         return model_path_list
     
-    def get_loss(self, loader, is_train=False):
+    def get_loss(self, loader, is_train=False, save_h5=False):
         # with torch.no_grad():
         #     net.eval()
         assert self.net is not None
@@ -438,12 +592,14 @@ class e3AijKernel:
             # get loss
             loss = criterion(H_pred, batch.label.to(device=config.device), batch.mask)
             
+            # backward propagation
             if is_train:
                 self.train_utils.optimizer.zero_grad()
                 loss.backward()
                 # TODO clip_grad_norm_(net.parameters(), 4.2, error_if_nonfinite=True)
                 self.train_utils.optimizer.step()
                 
+            # detailed loss on each target
             with torch.no_grad():
                 losses.update(loss.item(), batch.num_edges)
                 
@@ -452,33 +608,90 @@ class e3AijKernel:
                         target_loss = criterion(H_pred[..., slice(self.net_out_info.slices[i], self.net_out_info.slices[i + 1])], 
                                                 batch.label[..., slice(self.net_out_info.slices[i], self.net_out_info.slices[i + 1])].to(device=config.device),
                                                 batch.mask[..., slice(self.net_out_info.slices[i], self.net_out_info.slices[i + 1])])
-                        if self.spinful:
+                        if self.dataset_info.spinful:
                             if config.convert_net_out:
-                                num_hoppings = batch.mask[:, self.net_out_info.slices[i] * 4].sum() # ! this is not correct
+                                num_hoppings = batch.mask[:, self.net_out_info.slices[i] * 4].sum().item() # ! this is not correct
                             else:
-                                num_hoppings = batch.mask[:, 0, self.net_out_info.slices[i]].sum()
+                                num_hoppings = batch.mask[:, 0, self.net_out_info.slices[i]].sum().item()
                         else:
-                            num_hoppings = batch.mask[:, self.net_out_info.slices[i]].sum()
+                            num_hoppings = batch.mask[:, self.net_out_info.slices[i]].sum().item()
                         loss_list[i].update(target_loss.item(), num_hoppings)
                     
+            # record output in h5 (for testing)
+            if save_h5:
+                self.save_test_result(batch, H_pred, os.path.join(self.train_config.save_dir, 'test_result.h5'))
+        
         return losses, loss_list
     
-    def update_hopping(self, H_prev, batch, H_pred, debug=False):
-        np_dtype = self.train_config.np_dtype
-        atom_num_orbitals = [sum(map(lambda x: 2 * x + 1, atom_orbital_types)) for atom_orbital_types in self.dataset.info['orbital_types']]
-        hamiltonians = {}
-        for index_edge in range(batch.edge_index.shape[1]):
-            key_term = str(batch.edge_key[index_edge].tolist())
-            i, j = batch.x[batch.edge_index[:, index_edge]]
+    @staticmethod
+    def save_test_result(batch, H_pred, h5_dir):
+        assert batch.num_graphs == 1
+        stru_id = batch.stru_id[0]
+        with h5py.File(h5_dir, 'a') as f:
+            if stru_id in f:
+                if isinstance(H_pred, torch.Tensor):
+                    H_pred = H_pred.cpu().numpy()
+                g = f[stru_id]
+                for name in ['H_pred', 'label', 'mask']:
+                    prev = np.array(g[name])
+                    del g[name]
+                    if name == 'H_pred':
+                        g[name] = np.concatenate((prev, H_pred), axis=-1)
+                    else:
+                        g[name] = np.concatenate((prev, getattr(batch, name)), axis=-1)
+            else:
+                g = f.create_group(stru_id)
+                g['node_attr'] = batch.x.cpu()
+                g['edge_index'] = batch.edge_index.cpu()
+                g['edge_key'] = batch.edge_key.cpu()
+                g['edge_attr'] = batch.edge_attr.cpu()
+                g['label'] = batch.label.cpu()
+                g['mask'] = batch.mask.cpu()
+                g['H_pred'] = H_pred.cpu()
+            
+            '''test_result.h5 file structure
+            +--"/"
+            |   +-- group "stru1_id"
+            |   |   +-- dataset node_attr
+            |   |   +-- dataset edge_index
+            |   |   +-- dataset edge_key
+            |   |   +-- dataset edge_attr
+            |   |   +-- dataset label
+            |   |   +-- dataset mask
+            |   |   +-- dataset H_pred
+            |   |   |
+            |   +-- group "stru2_id"
+            |   |   +-- ... (similar with above)
+            |   |   |
+            |   +-- ...
+            '''
+    
+    def update_hopping(self, H_prev, H_pred, node_attr, edge_index, edge_key, debug=False):
+        # requires dataset_info, train_config, net_out_info
+        # node_attr (element type -- batch.x), edge_index, edge_key come from batch
+                
+        if isinstance(H_pred, torch.Tensor):
+            module = 'torch'
+            dtype = self.train_config.torch_dtype
+        elif isinstance(H_pred, np.ndarray):
+            module = 'np'
+            dtype = self.train_config.np_dtype
+        else:
+            raise ValueError
+        
+        atom_num_orbitals = [sum(map(lambda x: 2 * x + 1, atom_orbital_types)) for atom_orbital_types in self.dataset_info.orbital_types]
+        for index_edge in range(edge_index.shape[1]):
+            key_term = str(edge_key[index_edge].tolist())
+            i, j = node_attr[edge_index[:, index_edge]]
             if key_term not in H_prev.keys():
                 fill = 0 if debug else np.nan
                 fill_sp = 0 + 0j if debug else np.nan + np.nan * 1j
-                if self.spinful:
-                    init = np.full((atom_num_orbitals[i] * 2, atom_num_orbitals[j] * 2), fill_sp, dtype=flt2cplx(np_dtype))
+                if self.dataset_info.spinful:
+                    init = eval(module).full((atom_num_orbitals[i] * 2, atom_num_orbitals[j] * 2), fill_sp, dtype=flt2cplx(dtype))
                 else:
-                    init = np.full((atom_num_orbitals[i], atom_num_orbitals[j]), fill, dtype=np_dtype)
+                    init = eval(module).full((atom_num_orbitals[i], atom_num_orbitals[j]), fill, dtype=dtype)
                 H_prev[key_term] = init
-            N_M_str_edge = f'{self.dataset.info["index_to_Z"][i].item()} {self.dataset.info["index_to_Z"][j].item()}'
+            N_M_str_edge = f'{self.dataset_info.index_to_Z[i].item()} {self.dataset_info.index_to_Z[j].item()}'
             for index_target, equivariant_block in enumerate(self.net_out_info.blocks):
                 for N_M_str, block_slice in equivariant_block.items():
                     if N_M_str == N_M_str_edge:
@@ -487,7 +700,7 @@ class e3AijKernel:
                         len_row = block_slice[1] - block_slice[0]
                         len_col = block_slice[3] - block_slice[2]
                         slice_out = slice(self.net_out_info.slices[index_target], self.net_out_info.slices[index_target + 1])
-                        if self.spinful:
+                        if self.dataset_info.spinful:
                             slice_row_ds = slice(atom_num_orbitals[i] + block_slice[0], atom_num_orbitals[i] + block_slice[1])
                             slice_col_ds = slice(atom_num_orbitals[j] + block_slice[2], atom_num_orbitals[j] + block_slice[3])
                             H_prev[key_term][slice_row, slice_col] = H_pred[index_edge, 0, slice_out].reshape(len_row, len_col)
@@ -568,10 +781,13 @@ class e3AijKernel:
                                           shuffle=False,
                                           sampler=SubsetRandomSampler(extra_val_indices),
                                           collate_fn=Collater())
+        test_indices = indices[train_size + val_size:train_size + val_size + test_size]
+        if config.extra_val:
+            test_indices.extend(extra_val_indices)
         test_loader = DataLoader(dataset,
-                                 batch_size=config.batch_size,
+                                 batch_size=1,
                                  shuffle=False,
-                                 sampler=SubsetRandomSampler(indices[train_size + val_size:train_size + val_size + test_size]),
+                                 sampler=SubsetRandomSampler(test_indices),
                                  collate_fn=Collater())
         
         return train_loader, val_loader, extra_val_loader, test_loader
@@ -630,21 +846,25 @@ class e3AijKernel:
         # = write report =
         if info.val_losses.avg < info.best_loss:
             if len(self.net_out_info.js) > 1:
-                target_loss_list = [(info.val_loss_list[i].avg, i) for i in range(len(info.val_loss_list))]
-                target_loss_list.sort(key=lambda x: x[0], reverse=True)
-                report = open(os.path.join(config.save_dir, 'report.txt'), 'w')
-                print(f'Best model:', file=report)
-                print(out_info, file=report)
-                print('\n------- Detailed losses of each target -------', file=report)
-                print('Losses are sorted in descending order', file=report)
-                for i in range(len(self.net_out_info.js)):
-                    index_target = target_loss_list[i][1]
-                    print(f'\n======= No.{i:03}: Target {index_target:03} =======', file=report)
-                    print('Validation loss:           ', target_loss_list[i][0], file=report)
-                    print('Angular quantum numbers:   ', self.net_out_info.js[index_target], file=report)
-                    print('Target blocks:             ', config.target_blocks[index_target], file=report)
-                    print('Position in H matrix:      ', self.net_out_info.blocks[index_target], file=report)
-                report.close()
+                file = open(os.path.join(config.save_dir, 'train_report.txt'), 'w')
+                print(f'Best model:', file=file)
+                print(out_info, end='\n\n', file=file)
+                self.write_report(info.val_loss_list, file=file)
+                file.close()
+            
+    def write_report(self, loss_list, file=sys.stdout):
+        target_loss_list = [(loss_list[i].avg, i) for i in range(len(loss_list))]
+        target_loss_list.sort(key=lambda x: x[0], reverse=True)
+        
+        print('------- Detailed losses of each target -------', file=file)
+        print('Losses are sorted in descending order', file=file)
+        for i in range(len(self.net_out_info.js)):
+            index_target = target_loss_list[i][1]
+            print(f'\n======= No.{i:03}: Target {index_target:03} =======', file=file)
+            print('Validation loss:           ', target_loss_list[i][0], file=file)
+            print('Angular quantum numbers:   ', self.net_out_info.js[index_target], file=file)
+            print('Target blocks:             ', self.train_config.target_blocks[index_target], file=file)
+            print('Position in H matrix:      ', self.net_out_info.blocks[index_target], file=file)
     
     @staticmethod
     def convert_ijji_hamiltonians(H_pred_list):

@@ -1,4 +1,5 @@
 import warnings
+import os
 import torch
 from torch import nn
 from torch._C import dtype
@@ -456,3 +457,13 @@ class Net(nn.Module):
         info += f'\noutput edge: ({self.irreps_out_edge})'
         
         return info
+    
+    def analyze_tp(self, path):
+        os.makedirs(path, exist_ok=True)
+        for index, (nupd, eupd) in enumerate(zip(self.node_update_blocks, self.edge_update_blocks)):
+            fig, ax = nupd.conv.tp.visualize()
+            fig.savefig(os.path.join(path, f'node_update_{index}.png'))
+            fig.clf()
+            fig, ax = eupd.conv.tp.visualize()
+            fig.savefig(os.path.join(path, f'edge_update_{index}.png'))
+            fig.clf()

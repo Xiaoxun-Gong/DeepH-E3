@@ -11,7 +11,8 @@ from e3Aij import e3AijKernel
 
 parser = argparse.ArgumentParser(description='Evaluate e3Aij model to get hamiltonians_pred.h5')
 parser.add_argument('--config', type=str, help='Config file for evaluation')
+parser.add_argument('--debug', action='store_true', help='Fill unpredicted matrix elements with 0 instead of throwing error.')
 args = parser.parse_args()
 
 kernel = e3AijKernel()
-kernel.eval(args.config)
+kernel.eval(args.config, debug=args.debug)

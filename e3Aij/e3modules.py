@@ -91,22 +91,33 @@ class Rotate:
         irreps_right = Irreps([(1, (l, (- 1) ** l)) for l in orbital_types_right])
         U_left = irreps_left.D_from_matrix(R_e3nn)
         U_right = irreps_right.D_from_matrix(R_e3nn)
-        openmx2wiki_left = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_left])
-        openmx2wiki_right = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_right])
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
         if self.spinful:
             U_left = torch.kron(self.D_one_half(R_e3nn), U_left)
             U_right = torch.kron(self.D_one_half(R_e3nn), U_right)
-            openmx2wiki_left = torch.block_diag(openmx2wiki_left, openmx2wiki_left)
-            openmx2wiki_right = torch.block_diag(openmx2wiki_right, openmx2wiki_right)
         return openmx2wiki_left.T @ U_left.transpose(-1, -2).conj() @ openmx2wiki_left @ H \
                @ openmx2wiki_right.T @ U_right @ openmx2wiki_right
 
-    def wiki2openmx_H(self, H, l_left, l_right):
-        return self.Us_openmx2wiki[l_left].T @ H @ self.Us_openmx2wiki[l_right]
+    def wiki2openmx_H(self, H, orbital_types_left, orbital_types_right):
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
+        return openmx2wiki_left.T @ H @ openmx2wiki_right
 
-    def openmx2wiki_H(self, H, l_left, l_right):
-        return self.Us_openmx2wiki[l_left] @ H @ self.Us_openmx2wiki[l_right].T
+    def openmx2wiki_H(self, H, orbital_types_left, orbital_types_right):
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
+        return openmx2wiki_left @ H @ openmx2wiki_right.T
 
+    def openmx2wiki_left_right(self, orbital_types_left, orbital_types_right):
+        if isinstance(orbital_types_left, int):
+            orbital_types_left = [orbital_types_left]
+        if isinstance(orbital_types_right, int):
+            orbital_types_right = [orbital_types_right]
+        openmx2wiki_left = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_left])
+        openmx2wiki_right = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_right])
+        if self.spinful:
+            openmx2wiki_left = torch.block_diag(openmx2wiki_left, openmx2wiki_left)
+            openmx2wiki_right = torch.block_diag(openmx2wiki_right, openmx2wiki_right)
+        return openmx2wiki_left, openmx2wiki_right
+    
     def rotate_matrix_convert(self, R):
         # (x, y, z)顺序排列的旋转矩阵转换为(y, z, x)顺序(see e3nn.o3.spherical_harmonics() and https://docs.e3nn.org/en/stable/guide/change_of_basis.html)
         return torch.eye(3)[[1, 2, 0]] @ R @ torch.eye(3)[[1, 2, 0]].T # todo: cuda

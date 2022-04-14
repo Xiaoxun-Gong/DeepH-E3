@@ -196,7 +196,7 @@ raw_data_dir
 
         return index_to_Z, Z_to_index
 
-    def set_mask(self, targets, convert_to_net=False):
+    def set_mask(self, targets, del_Aij=True, convert_to_net=False):
         begin = time.time()
         print("\nSetting mask for dataset...")
         
@@ -263,7 +263,8 @@ raw_data_dir
                         else:
                             label[condition_index[0], out_slice] += data.Aij[:, condition_slice_i, condition_slice_j].reshape(data.num_edges, -1)[condition_index]
                             mask[condition_index[0], out_slice] += 1
-            del data.Aij_mask
+            if del_Aij:
+                del data.Aij_mask
             if data.Aij is not None:
                 if convert_to_net:
                     label = construct_kernel.get_net_out(label)
@@ -273,7 +274,8 @@ raw_data_dir
                 if spinful and convert_to_net:
                     mask = construct_kernel.convert_mask(mask)
                 data.mask = mask
-                del data.Aij
+                if del_Aij:
+                    del data.Aij
             data_list_mask.append(data)
 
         self.__indices__ = None
