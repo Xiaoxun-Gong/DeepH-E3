@@ -1,4 +1,5 @@
 import os
+from sched import scheduler
 import shutil
 import sys
 import random
@@ -87,8 +88,46 @@ def flt2cplx(flt_dtype):
     return cplx_dtype
 
 
+class SlipSlopLR:
+    def __init__(self, optimizer, start=1400, interval=200, decay_rate=0.5) -> None:
+        self.optimizer = optimizer
+        
+        self.start = start
+        self.interval = interval
+        self.decay_rate = decay_rate
+        
+        self.next_epoch = 0
+        self.last_decayed = None
+        
+    def step(self, val_loss=None):
+        epoch = self.next_epoch
+        self.next_epoch += 1
+        
+        next_decay = -1
+        if self.last_decayed is not None:
+            next_decay = self.last_decayed + self.interval
+        
+        if epoch == self.start or (epoch == next_decay):
+            self.decay()
+            self.last_decayed = epoch
+        
+    def decay(self):
+        num_lr = 0
+        for param_group in self.optimizer.param_groups:
+            last_lr = param_group['lr']
+            param_group['lr'] *= self.decay_rate
+            new_lr = param_group['lr'] 
+            print(f'Learning rate {num_lr} is decayed from {last_lr} to {new_lr}.')
+    
+    def state_dict(self):
+        return {key: value for key, value in self.__dict__.items() if key != 'optimizer'}
+    
+    def load_state_dict(self, state_dict):
+        self.__dict__.update(state_dict)
+
+
 class RevertDecayLR:
-    def __init__(self, model, optimizer, save_model_dir, decay_patience=20, decay_rate=0.8, torch_scheduler=None):
+    def __init__(self, model, optimizer, save_model_dir, decay_patience=20, decay_rate=0.8, scheduler_type=0, scheduler_params=None):
         self.model = model
         self.optimizer = optimizer
         
@@ -109,22 +148,39 @@ class RevertDecayLR:
         self.bad_epochs = 0
         
         self.scheduler = None
-        if torch_scheduler:
-            self.scheduler = ReduceLROnPlateau(optimizer=optimizer, **torch_scheduler)
+        self.alpha = None
+        self.loss_smoothed = None
+        
+        self.scheduler_type = scheduler_type
+        if scheduler_type == 1:
+            self.alpha = scheduler_params.pop('alpha', 0.1)
+            self.scheduler = ReduceLROnPlateau(optimizer=optimizer, **scheduler_params)
+        elif scheduler_type == 2:
+            self.scheduler = SlipSlopLR(optimizer=optimizer, **scheduler_params)
+        elif scheduler_type == 0:
+            pass
+        else:
+            raise ValueError(f'Unknown scheduler type: {scheduler_type}')
         
     def load_state_dict(self, state_dict):
         tssd = state_dict.pop('torch_scheduler_state_dict', None)
         if tssd is not None:
             self.scheduler = ReduceLROnPlateau(optimizer=self.optimizer)
             self.scheduler.load_state_dict(tssd)
+        sssd = state_dict.pop('slipslop_state_dict', None)
+        if sssd is not None:
+            self.scheduler = SlipSlopLR(optimizer=self.optimizer)
+            self.scheduler.load_state_dict(sssd)
         
         self.__dict__.update(state_dict)
     
     def state_dict(self):
         state_dict = {key: value for key, value in self.__dict__.items() 
                       if key not in ['model', 'optimizer', 'save_model_dir', 'scheduler']}
-        if self.scheduler is not None:
+        if self.scheduler_type == 1:
             state_dict.update({'torch_scheduler_state_dict': self.scheduler.state_dict()})
+        elif self.scheduler_type == 2:
+            state_dict.update({'slipslop_state_dict': self.scheduler.state_dict()})
         return state_dict
     
     def step(self, val_loss):
@@ -151,8 +207,17 @@ class RevertDecayLR:
         #         self.decay()
         
         # = step torch scheduler =
-        if self.scheduler is not None:
-            self.scheduler.step(val_loss)
+        if self.scheduler_type == 1:
+            # exponential smoothing of val_loss
+            # loss_smoothed(t) = alpha*loss(t)+(1-alpha)*loss_smoothed(t-1)
+            # alpha=0.1 by default
+            if self.loss_smoothed is None:
+                self.loss_smoothed = val_loss
+            else:
+                self.loss_smoothed = self.alpha * val_loss + (1.0 - self.alpha) * self.loss_smoothed
+            self.scheduler.step(self.loss_smoothed)
+        elif self.scheduler_type == 2:
+            self.scheduler.step()
         
         # = check is best =
         is_best = val_loss < self.best_loss
@@ -161,10 +226,13 @@ class RevertDecayLR:
             self.best_epoch = epoch
 
         # = save model =
-        try:
-            self.save_model(epoch, val_loss, is_best=is_best)
-        except KeyboardInterrupt:
-            print('Interrupting while saving model might cause the saved model to be deprecated')
+        save_complete = False
+        while not save_complete:
+            try:
+                self.save_model(epoch, val_loss, is_best=is_best)
+                save_complete = True
+            except KeyboardInterrupt:
+                print('Interrupting while saving model might cause the saved model to be deprecated')
 
     def revert(self):
         best_checkpoint = torch.load(os.path.join(self.save_model_dir, 'best_model.pkl'))
@@ -187,7 +255,7 @@ class RevertDecayLR:
             print(f'Learning rate {num_lr} is decayed from {last_lr} to {new_lr}.')
         # self.decay_step += 1
         
-        if self.scheduler is not None:
+        if self.scheduler_type == 1:
             self.scheduler.cooldown_counter = self.scheduler.cooldown # start torch_scheduler cooldown
     
     def save_model(self, epoch, val_loss, is_best=False, **kwargs):
@@ -239,35 +307,7 @@ def process_targets(orbital_types, index_to_Z, targets):
     return equivariant_blocks, out_js_list, out_slices
 
 
-class assemble_H:
-    def __init__(self, orbital_types, index_to_Z, targets):
-        self.equivariant_blocks, out_js_list, self.out_slices = process_targets(orbital_types, index_to_Z, targets)
-        
-        self.index_to_Z = index_to_Z
-                
-        self.atom_num_orbital = [sum(map(lambda x: 2 * x + 1, atom_orbital_types)) for atom_orbital_types in orbital_types]
-        
-    def get_H(self, x, edge_idx, edge_fea):
-        Hij_list = []
-        for index_edge in range(edge_idx.shape[1]):
-            Hij_edge = torch.zeros(self.atom_num_orbital[x[edge_idx[0, index_edge]]],
-                                self.atom_num_orbital[x[edge_idx[1, index_edge]]],
-                                dtype=torch.get_default_dtype(), device='cpu')
-            N_M_str_edge = str(self.index_to_Z[x[edge_idx[0, index_edge]]].item()) + ' ' + str(self.index_to_Z[x[edge_idx[1, index_edge]]].item())
-            for index_target, target in enumerate(self.equivariant_blocks):
-                for N_M_str, block_slice in target.items():
-                    if N_M_str == N_M_str_edge:
-                        slice_row = slice(block_slice[0], block_slice[1])
-                        slice_col = slice(block_slice[2], block_slice[3])
-                        len_row = block_slice[1] - block_slice[0]
-                        len_col = block_slice[3] - block_slice[2]
-                        slice_out = slice(self.out_slices[index_target], self.out_slices[index_target + 1])
-                        Hij_edge[slice_row, slice_col] = edge_fea[index_edge, slice_out].reshape(len_row, len_col)
-            Hij_list.append(Hij_edge)
-            
-        return Hij_list
-
-def irreps_from_l1l2(l1, l2, mul, spinful):
+def irreps_from_l1l2(l1, l2, mul, spinful, no_parity=False):
     r'''
     non-spinful example: l1=1, l2=2 (1x2) ->
     required_irreps_full=1+2+3, required_irreps=1+2+3, required_irreps_x1=None
@@ -279,8 +319,9 @@ def irreps_from_l1l2(l1, l2, mul, spinful):
     
     notice that required_irreps_x1 is a list of Irreps
     '''
-    
-    p = (-1) ** (l1 + l2)
+    p = 1
+    if not no_parity:
+        p = (-1) ** (l1 + l2)
     required_ls = range(abs(l1 - l2), l1 + l2 + 1)
     required_irreps = Irreps([(mul, (l, p)) for l in required_ls])
     required_irreps_full = required_irreps
@@ -295,7 +336,7 @@ def irreps_from_l1l2(l1, l2, mul, spinful):
     return required_irreps_full, required_irreps, required_irreps_x1
     
 
-def orbital_analysis(atom_orbitals, required_block_type, spinful, targets=None, element_pairs=None, verbose=''):
+def orbital_analysis(atom_orbitals, required_block_type, spinful, targets=None, element_pairs=None, no_parity=False, verbose=''):
     r'''
     example of atom_orbitals: {'42': [0, 0, 0, 1, 1, 2, 2], '16': [0, 0, 1, 1, 2]}
     
@@ -312,7 +353,7 @@ def orbital_analysis(atom_orbitals, required_block_type, spinful, targets=None, 
                 if l1 is None and l2 is None:
                     l1 = atom_orbitals[atom1][block_indices[0]]
                     l2 = atom_orbitals[atom2][block_indices[1]]
-                    net_out_irreps += irreps_from_l1l2(l1, l2, 1, spinful)[0]
+                    net_out_irreps += irreps_from_l1l2(l1, l2, 1, spinful, no_parity=no_parity)[0]
                 else:
                     assert l1 == atom_orbitals[atom1][block_indices[0]] and l2 == atom_orbitals[atom2][block_indices[1]], f'Hamiltonian block angular quantum numbers not all the same in target {target}'
                     
@@ -361,7 +402,7 @@ def orbital_analysis(atom_orbitals, required_block_type, spinful, targets=None, 
                 targets.append(target)
                 
                 l1, l2 = il_list[hopping1_index][0], il_list[hopping1_index][2]
-                irreps_new = irreps_from_l1l2(l1, l2, 1, spinful)[0]
+                irreps_new = irreps_from_l1l2(l1, l2, 1, spinful, no_parity=no_parity)[0]
                 net_out_irreps_list.append(irreps_new)
                 net_out_irreps = net_out_irreps + irreps_new 
         

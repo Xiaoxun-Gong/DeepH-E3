@@ -4,11 +4,11 @@ from os.path import dirname, abspath
 import sys
 import shutil
 import warnings
-from matplotlib.pyplot import axis, flag
 import numpy as np
 from collections import namedtuple
 import json
 import h5py
+from tqdm import tqdm
 
 import torch
 from torch import optim
@@ -111,7 +111,7 @@ class NetOutInfo:
         return flag
     
     
-class e3AijKernel:
+class DeepHE3Kernel:
     
     def __init__(self):
         
@@ -129,8 +129,6 @@ class e3AijKernel:
         
         self.train_utils = None
         self.train_info = None
-        
-        torch.set_num_threads(8) # todo: put this into config
         
     def load_config(self, train_config_path=None, eval_config_path=None):
         if train_config_path is not None:
@@ -160,7 +158,7 @@ class e3AijKernel:
         sys.stdout = Logger(os.path.join(config.save_dir, "result.txt"))
         sys.stderr = Logger(os.path.join(config.save_dir, "stderr.txt"))
 
-        print('\n------- e3Aij model training begins -------')
+        print('\n------- DeepH-E3 model training begins -------')
         print(f'Output will be stored under: {config.save_dir}')
 
         # = random seed =
@@ -171,9 +169,9 @@ class e3AijKernel:
         print(f'Data type during training: {config.torch_dtype}')
         torch.set_default_dtype(config.torch_dtype)
 
-        # = save e3Aij script =
+        # = save DeepH-E3 script =
         self.save_script()
-        print('Saved e3Aij source code to output dir')
+        print('Saved DeepH-E3 source code to output dir')
         
         # = prepare dataset =
         print('\n------- Preparation of training data -------')
@@ -221,9 +219,11 @@ class e3AijKernel:
         tb_writer = SummaryWriter(os.path.join(config.save_dir, 'tensorboard'))
         print('Tensorboard recorder initialized')
         # = LR scheduler =
-        scheduler = RevertDecayLR(net, optimizer, config.save_dir, config.revert_decay_patience, config.revert_decay_rate, config.torch_scheduler)
-        if config.torch_scheduler:
+        scheduler = RevertDecayLR(net, optimizer, config.save_dir, config.revert_decay_patience, config.revert_decay_rate, config.scheduler_type, config.scheduler_params)
+        if config.scheduler_type == 1:
             print('Using pytorch scheduler ReduceLROnPlateau')
+        elif config.scheduler_type == 2:
+            print('Using "slippery slope" scheduler')
         
         # load from checkpoint
         if config.checkpoint_dir:
@@ -300,13 +300,24 @@ class e3AijKernel:
         print('\nTraining finished.')
 
         print('\n------- Testing network on test set -------')
+        checkpoint = torch.load(os.path.join(config.save_dir, 'best_model.pkl'), map_location=config.device)
+        self.net.load_state_dict(checkpoint['state_dict'])
+        print(f'Using best model at epoch {checkpoint["epoch"]} with val_loss {checkpoint["val_loss"]}')
+        print(f'Testing...')
+        test_begin = time.time()
+        test_h5 = os.path.join(self.train_config.save_dir, 'test_result.h5')
+        if os.path.isfile(test_h5):
+            print(f'Warning: file already exists and will be replaced: {test_h5}')
+            os.remove(test_h5)
         with torch.no_grad():
             test_losses, test_loss_list = self.get_loss(test_loader, save_h5=True)
+        print(f'Test finished, cost {time.time() - test_begin:.2f}s.')
         print(f'Test loss: {test_losses.avg:.4e}')
-        print('Test results saved to "test_result.h5". It can be analyzed using "e3Aij-analyze".')
+        print('Test results saved to "test_result.h5". It can be analyzed using "deephe3-analyze.py".')
         with open(os.path.join(config.save_dir, 'test_report.txt'), 'w') as f:
             print(f'Test loss: {test_losses.avg:.4e}\n', file=f)
-            self.write_report(test_loss_list, file=f)
+            if len(self.net_out_info.js) > 1:
+                self.write_report(test_loss_list, file=f)
         print('Test report written to: "test_report.txt".')
         
     def eval(self, config, debug=False):
@@ -329,7 +340,10 @@ class e3AijKernel:
         
         if not eval_config.inference:
             h5file = os.path.join(eval_config.out_dir, 'test_result.h5')
-            assert not os.path.isfile(h5file)
+            if os.path.isfile(h5file):
+                print(f'Warning: file already exists and will be replaced: {h5file}')
+                os.remove(h5file)
+            h5_fp = h5py.File(h5file, 'w')
         
         print('\n------- Evaluating model -------')
         for index_model, model_path in enumerate(model_path_list):
@@ -352,18 +366,21 @@ class e3AijKernel:
                     net_out_combined.merge(net_out_info)
             
             with torch.no_grad():
-                for index_stru, data in enumerate(dataset):
+                iterable = tqdm(enumerate(dataset)) if eval_config.test_only else enumerate(dataset)
+                for index_stru, data in iterable:
                     if len(H_pred_list) <= index_stru:
                         H_pred_list.append({})
-                    print(f'Getting model {index_model} output on structure "{data.stru_id}"...')
+                    if not eval_config.test_only: print(f'Getting model {index_model} output on structure "{data.stru_id}"...')
                     batch = collate([data])
+                    start = time.time()
                     output, output_edge = net(batch.to(device=eval_config.device))
                     H_pred = construct_kernel.get_H(output_edge).cpu()
                     self.update_hopping(H_pred_list[index_stru], H_pred, batch.x, batch.edge_index, batch.edge_key, debug=debug)
+                    if not eval_config.test_only: print(f'Finished, cost {time.time() - start:.2f} seconds.')
                     
                     if not eval_config.inference:
-                        print(f'Saving model {index_model} output on structure "{data.stru_id}" to test_result.h5')
-                        self.save_test_result(batch, H_pred, h5file)
+                        if not eval_config.test_only: print(f'Saving model {index_model} output on structure "{data.stru_id}" to test_result.h5')
+                        self.save_test_result(batch, H_pred, h5_fp)
             
             print(f'Finished evaluating model {index_model} on all structures')
         
@@ -380,18 +397,20 @@ class e3AijKernel:
             self.convert_ijji_hamiltonians(H_pred_list)
             
         if not eval_config.inference:
+            h5_fp.close()
             src = os.path.join(eval_config.out_dir, 'src')
             os.makedirs(src, exist_ok=True)
             net_out_combined.save_json(os.path.join(eval_config.out_dir, 'src'))
             shutil.copyfile(self.train_config.config_file, os.path.join(src, 'train.ini'))
             
-        print('\n------- Output -------')
-        for H_dict, data in zip(H_pred_list, dataset):
-            os.makedirs(os.path.join(eval_config.out_dir, data.stru_id), exist_ok=True)
-            print(f'Writing output to "{data.stru_id}/hamiltonians_pred.h5"')
-            with h5py.File(os.path.join(eval_config.out_dir, f'{data.stru_id}/hamiltonians_pred.h5'), 'w') as f:
-                for k, v in H_dict.items():
-                    f[k] = v
+        if not eval_config.test_only:
+            print('\n------- Output -------')
+            for H_dict, data in zip(H_pred_list, dataset):
+                os.makedirs(os.path.join(eval_config.out_dir, data.stru_id), exist_ok=True)
+                print(f'Writing output to "{data.stru_id}/hamiltonians_pred.h5"')
+                with h5py.File(os.path.join(eval_config.out_dir, f'{data.stru_id}/hamiltonians_pred.h5'), 'w') as f:
+                    for k, v in H_dict.items():
+                        f[k] = v
         
     def get_graph(self, config: BaseConfig, inference=False): # todo: dataset info stored separately
         process_only = config.__class__ == BaseConfig # isinstance(config, BaseConfig)
@@ -401,8 +420,8 @@ class e3AijKernel:
         else:
             if config.dft_data_dir:
                 print('\nPreprocessing data from DFT calculated result...')
-                process_data_py = os.path.join(dirname(dirname(abspath(__file__))), 'process_data_tools/process_data.py')
-                cmd = f'python {process_data_py} --input_dir {config.dft_data_dir} --output_dir {config.processed_data_dir} --simpout' + (' --olp' if inference else '')
+                process_data_py = os.path.join(dirname(abspath(__file__)), 'process_data_tools/process_data.py')
+                cmd = f'python {process_data_py} --input_dir {config.dft_data_dir} --output_dir {config.processed_data_dir} --simpout' + (' --olp' if config.get_olp else '')
                 return_code = os.system(cmd)
                 assert return_code == 0, f'Error occured in executing command: "{cmd}"'
             print('\nProcessing graph data...')
@@ -454,6 +473,8 @@ class e3AijKernel:
                   num_block=config.num_blocks,
                   r_max=config.cutoff_radius,
                   use_sc=True,
+                  no_parity=config.no_parity,
+                  use_sbf=config.use_sbf,
                   only_ij=config.only_ij,
                   spinful=False,
                   if_sort_irreps=False
@@ -473,7 +494,7 @@ class e3AijKernel:
         num_species = len(self.dataset_info.index_to_Z)
         with open(os.path.join(src_path, 'build_model.py'), 'w') as f:
             pf = lambda x: print(x, file=f)
-            pf(f"from e3Aij_1 import Net")
+            pf(f"from deephe3_1 import Net")
             pf(f"net = Net(")
             pf(f"    num_species={num_species},")
             pf(f"    irreps_embed_node='{config.irreps_embed_node}',")
@@ -488,8 +509,9 @@ class e3AijKernel:
             pf(f"    num_block={config.num_blocks},")
             pf(f"    r_max={config.cutoff_radius},")
             pf(f"    use_sc={True},")
+            pf(f"    no_parity={config.no_parity},")
+            pf(f"    use_sbf={config.use_sbf},")
             pf(f"    only_ij={config.only_ij},")
-            pf(f"    spinful={False},")
             pf(f"    if_sort_irreps={False}")
             pf(f")")
         
@@ -535,7 +557,8 @@ class e3AijKernel:
         construct_kernel = e3TensorDecomp(config.net_out_irreps, 
                                           self.net_out_info.js, 
                                           default_dtype_torch=torch.get_default_dtype(), 
-                                          spinful=self.dataset_info.spinful, 
+                                          spinful=self.dataset_info.spinful,
+                                          no_parity=config.no_parity, 
                                           if_sort=config.convert_net_out, 
                                           device_torch=device)
         
@@ -581,6 +604,9 @@ class e3AijKernel:
         loss_list = None
         if len(self.net_out_info.js) > 1 and not is_train:
             loss_list = [LossRecord() for _ in range(len(self.net_out_info.js))]
+            
+        if save_h5:
+            h5_fp = h5py.File(os.path.join(self.train_config.save_dir, 'test_result.h5'), 'w')
 
         for batch in loader:
             # get predicted H
@@ -619,62 +645,73 @@ class e3AijKernel:
                     
             # record output in h5 (for testing)
             if save_h5:
-                self.save_test_result(batch, H_pred, os.path.join(self.train_config.save_dir, 'test_result.h5'))
+                self.save_test_result(batch, H_pred, h5_fp) # 
+                
+        if save_h5:
+            h5_fp.close()
         
         return losses, loss_list
     
-    @staticmethod
-    def save_test_result(batch, H_pred, h5_dir):
+    def save_test_result(self, batch, H_pred, h5_fp):
         assert batch.num_graphs == 1
         stru_id = batch.stru_id[0]
-        with h5py.File(h5_dir, 'a') as f:
-            if stru_id in f:
-                if isinstance(H_pred, torch.Tensor):
-                    H_pred = H_pred.cpu().numpy()
-                g = f[stru_id]
-                for name in ['H_pred', 'label', 'mask']:
-                    prev = np.array(g[name])
-                    del g[name]
-                    if name == 'H_pred':
-                        g[name] = np.concatenate((prev, H_pred), axis=-1)
-                    else:
-                        g[name] = np.concatenate((prev, getattr(batch, name)), axis=-1)
-            else:
-                g = f.create_group(stru_id)
-                g['node_attr'] = batch.x.cpu()
-                g['edge_index'] = batch.edge_index.cpu()
-                g['edge_key'] = batch.edge_key.cpu()
-                g['edge_attr'] = batch.edge_attr.cpu()
-                g['label'] = batch.label.cpu()
-                g['mask'] = batch.mask.cpu()
-                g['H_pred'] = H_pred.cpu()
+
+        if stru_id in h5_fp:
+            if isinstance(H_pred, torch.Tensor):
+                H_pred = H_pred.cpu().numpy()
+            g = h5_fp[stru_id]
+            for name in ['H_pred', 'label', 'mask']:
+                prev = np.array(g[name])
+                del g[name]
+                if name == 'H_pred':
+                    g[name] = np.concatenate((prev, H_pred), axis=-1)
+                else:
+                    g[name] = np.concatenate((prev, getattr(batch, name).cpu()), axis=-1)
+        else:
+            g = h5_fp.create_group(stru_id)
+            g['node_attr'] = batch.x.cpu()
+            g['edge_index'] = batch.edge_index.cpu()
+            g['edge_key'] = batch.edge_key.cpu()
+            g['edge_attr'] = batch.edge_attr.cpu()
+            g['label'] = batch.label.cpu()
+            g['mask'] = batch.mask.cpu()
+            g['H_pred'] = H_pred.cpu()
             
-            '''test_result.h5 file structure
-            +--"/"
-            |   +-- group "stru1_id"
-            |   |   +-- dataset node_attr
-            |   |   +-- dataset edge_index
-            |   |   +-- dataset edge_key
-            |   |   +-- dataset edge_attr
-            |   |   +-- dataset label
-            |   |   +-- dataset mask
-            |   |   +-- dataset H_pred
-            |   |   |
-            |   +-- group "stru2_id"
-            |   |   +-- ... (similar with above)
-            |   |   |
-            |   +-- ...
-            '''
+            stru = g.create_group('structure')
+            stru['element'] = self.dataset_info.index_to_Z[batch.x].cpu()
+            stru['lat'] = batch.lattice[0].cpu()
+            stru['sites'] = batch.pos.cpu()
+        
+        '''test_result.h5 file structure
+        +--"/"
+        |   +-- group "stru1_id"
+        |   |   +-- dataset node_attr
+        |   |   +-- dataset edge_index
+        |   |   +-- dataset edge_key
+        |   |   +-- dataset edge_attr
+        |   |   +-- dataset label
+        |   |   +-- dataset mask
+        |   |   +-- dataset H_pred
+        |   |   +-- group "structure"
+        |   |   |   +-- dataset element
+        |   |   |   +-- dataset lat
+        |   |   |   +-- dataset sites
+        |   |   |   |
+        |   +-- group "stru2_id"
+        |   |   +-- ... (similar with above)
+        |   |   |
+        |   +-- ...
+        '''
     
     def update_hopping(self, H_prev, H_pred, node_attr, edge_index, edge_key, debug=False):
         # requires dataset_info, train_config, net_out_info
         # node_attr (element type -- batch.x), edge_index, edge_key come from batch
                 
         if isinstance(H_pred, torch.Tensor):
-            module = 'torch'
+            module = torch
             dtype = self.train_config.torch_dtype
         elif isinstance(H_pred, np.ndarray):
-            module = 'np'
+            module = np
             dtype = self.train_config.np_dtype
         else:
             raise ValueError
@@ -687,9 +724,9 @@ class e3AijKernel:
                 fill = 0 if debug else np.nan
                 fill_sp = 0 + 0j if debug else np.nan + np.nan * 1j
                 if self.dataset_info.spinful:
-                    init = eval(module).full((atom_num_orbitals[i] * 2, atom_num_orbitals[j] * 2), fill_sp, dtype=flt2cplx(dtype))
+                    init = module.full((atom_num_orbitals[i] * 2, atom_num_orbitals[j] * 2), fill_sp, dtype=flt2cplx(dtype))
                 else:
-                    init = eval(module).full((atom_num_orbitals[i], atom_num_orbitals[j]), fill, dtype=dtype)
+                    init = module.full((atom_num_orbitals[i], atom_num_orbitals[j]), fill, dtype=dtype)
                 H_prev[key_term] = init
             N_M_str_edge = f'{self.dataset_info.index_to_Z[i].item()} {self.dataset_info.index_to_Z[j].item()}'
             for index_target, equivariant_block in enumerate(self.net_out_info.blocks):
@@ -724,11 +761,12 @@ class e3AijKernel:
             shutil.copytree(os.path.join(old_dir, 'src'), os.path.join(config.save_dir, 'src'))
             shutil.copytree(os.path.join(old_dir, 'tensorboard'), os.path.join(config.save_dir, 'tensorboard'))
             shutil.copyfile(os.path.join(old_dir, 'best_model.pkl'), os.path.join(config.save_dir, 'best_model.pkl'))
+            shutil.copyfile(os.path.join(old_dir, 'model.pkl'), os.path.join(config.save_dir, 'model.pkl'))
             dst = os.path.join(config.save_dir, 'src_restart')
         os.makedirs(dst)
-        shutil.copyfile(os.path.join(src, 'train.py'), os.path.join(dst, 'train.py'))
+        shutil.copyfile(os.path.join(src, 'deephe3-train.py'), os.path.join(dst, 'train.py'))
         shutil.copyfile(config.config_file, os.path.join(dst, 'train.ini'))
-        shutil.copytree(os.path.join(src, 'e3Aij'), os.path.join(dst, 'e3Aij_1'))
+        shutil.copytree(os.path.join(src, 'deephe3'), os.path.join(dst, 'deephe3_1'))
     
     def get_loader(self):
         assert self.train_config is not None
@@ -748,12 +786,12 @@ class e3AijKernel:
         train_size = int(config.train_ratio * dataset_size)
         val_size = int(config.val_ratio * dataset_size)
         test_size = int(config.test_ratio * dataset_size)
-        assert train_size + val_size + test_size <= dataset_size
-        
-        dataset_size = len(indices)
-        train_size = int(config.train_ratio * dataset_size)
-        val_size = int(config.val_ratio * dataset_size)
-        test_size = int(config.test_ratio * dataset_size)
+        if config.train_size > 0:
+            train_size = config.train_size
+        if config.val_size > 0:
+            val_size = config.val_size
+        if config.test_size >= 0:
+            test_size = config.test_size
         assert train_size + val_size + test_size <= dataset_size
 
         np.random.shuffle(indices)
@@ -765,10 +803,10 @@ class e3AijKernel:
             print(f'Additionally validating on {len(extra_val_indices)} structure(s)')
 
         train_loader = DataLoader(dataset, 
-                                 batch_size=config.batch_size,
-                                 shuffle=False, 
-                                 sampler=SubsetRandomSampler(indices[:train_size]),
-                                 collate_fn=Collater())
+                                  batch_size=config.batch_size,
+                                  shuffle=False, 
+                                  sampler=SubsetRandomSampler(indices[:train_size]),
+                                  collate_fn=Collater())
         val_loader = DataLoader(dataset,
                                 batch_size=config.batch_size,
                                 shuffle=False,
@@ -802,7 +840,7 @@ class e3AijKernel:
         out_info = (f'Epoch #{info.epoch:<5d}  | '
                     f'Time: {d:02d}d {h:02d}h {m:02d}m  | '
                     f'LR: {info.lr:.2e}  | '
-                    f'Batch time: {info.epoch_time:6.2f}  | '
+                    f'Epoch time: {info.epoch_time:6.2f}  | '
                     f'Train loss: {info.train_losses.avg:.2e}  | ' # :11.8f
                     f'Val loss: {info.val_losses.avg:.2e}'
                     )

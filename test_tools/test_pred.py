@@ -4,13 +4,13 @@ import h5py
 import os
 
 
-rhp = h5py.File(
-    "/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0218_bi2se3/e3train/results/2022-03-14_14-10-14_testing/test/t-2-3/hamiltonians_pred.h5",
+h_pred = h5py.File(
+    "/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0627_deephCompare/3_bg/error_deeph/4-3/hamiltonians_pred.h5",
     "r",
 )
-processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0218_bi2se3/e3train/pred_twist/t-2-3' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
+processed_structure = '/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/0627_deephCompare/3_bg/processed/twisted2/t-4-3' # containing hamiltonians.h5, element.dat, orbital_types.dat, info.json
 
-simplified_output = False
+simplified_output = True
 
 rh = h5py.File(os.path.join(processed_structure, 'hamiltonians.h5'), "r")
 element = np.loadtxt(os.path.join(processed_structure, 'element.dat')).astype(int)
@@ -44,11 +44,11 @@ dif_num = {}
 for key in dif.keys():
     dif_num[key] = 0
     
-for key in rhp.keys():
+for key in h_pred.keys():
     atom_i = eval(key)[3] - 1
     atom_j = eval(key)[4] - 1
     N_M_str = f'{element[atom_i]} {element[atom_j]}'
-    dif[N_M_str] += np.abs(np.array(rh[key]) - np.array(rhp[key]))
+    dif[N_M_str] += np.abs(np.array(rh[key]) - np.array(h_pred[key]))
     dif_num[N_M_str] += 1
 
 dif_avg = {}
@@ -101,4 +101,4 @@ for k, v in dif.items():
 #     print()
 
 rh.close()
-rhp.close()
+h_pred.close()

@@ -40,6 +40,8 @@ class BaseConfig:
         self.target_data = self._config.get('data', 'target_data')
         self.dataset_name = self._config.get('data', 'dataset_name')
         
+        self.get_olp = self._config.get('data', 'get_overlap')
+        
         self.only_ij = False # todo
     
     def set_dtype(self, dtype):
@@ -85,9 +87,7 @@ class TrainConfig(BaseConfig):
         # set_target should be called once dataset has been prepared
         
     def get_basic_section(self):
-        self.device = torch.device(self._config.get('basic', 'device'))
-        dtype = self._config.get('basic', 'dtype')
-        self.set_dtype(dtype)
+        super().get_basic_section()
         self.seed = self._config.getint('basic', 'seed')
         self.checkpoint_dir = self._config.get('basic', 'checkpoint_dir')
         self.simp_out = self._config.getboolean('basic', 'simplified_output')
@@ -112,15 +112,22 @@ class TrainConfig(BaseConfig):
         self.train_ratio = self._config.getfloat('train', 'train_ratio')
         self.val_ratio = self._config.getfloat('train', 'val_ratio')
         self.test_ratio = self._config.getfloat('train', 'test_ratio')
+        
+        self.train_size = self._config.getint('train', 'train_size')
+        self.val_size = self._config.getint('train', 'val_size')
+        self.test_size = self._config.getint('train', 'test_size')
     
     def get_hypp_section(self):
         self.lr = self._config.getfloat('hyperparameters', 'learning_rate')
         self.adam_betas = eval(self._config.get('hyperparameters', 'Adam_betas'))
 
-        self.torch_scheduler = None
-        ts = self._config.get('hyperparameters', 'ReduceLROnPlateau')
+        self.scheduler_type = self._config.getint('hyperparameters', 'scheduler_type')
+        ts = self._config.get('hyperparameters', 'scheduler_params')
         if ts:
-            self.torch_scheduler = eval(ts)
+            ts = 'dict' + ts
+            self.scheduler_params = eval(ts)
+        else:
+            self.scheduler_params = dict()
         
         self.revert_decay_patience = self._config.getint('hyperparameters', 'revert_decay_patience')
         self.revert_decay_rate = self._config.getfloat('hyperparameters', 'revert_decay_rate')
@@ -128,7 +135,9 @@ class TrainConfig(BaseConfig):
     def get_target_section(self):
         # target
         self.target = self._config.get('target', 'target')
-        self.tbt0 = self._config.get('target', 'target_blocks_type')[0].lower()
+        tbt = self._config.get('target', 'target_blocks_type')
+        assert len(tbt) > 0, 'Invalid target_blocks_type'
+        self.tbt0 = tbt[0].lower()
         self._target_blocks = None
         if self.tbt0 == 's':
             self._target_blocks = eval(self._config.get('target', 'target_blocks'))
@@ -142,8 +151,20 @@ class TrainConfig(BaseConfig):
         self.cutoff_radius = self._config.getfloat('network', 'cutoff_radius')
         self.only_ij = self._config.getboolean('network', 'only_ij')
         assert not self.only_ij
-        sh_lmax = self._config.getint('network', 'spherical_harmonics_lmax')
-        self.irreps_sh = Irreps([(1, (i, (-1) ** i)) for i in range(sh_lmax + 1)])
+        self.no_parity = self._config.getboolean('network', 'ignore_parity')
+        
+        sh_lmax = self._config.get('network', 'spherical_harmonics_lmax')
+        sbf_irreps = self._config.get('network', 'spherical_basis_irreps')
+        if sh_lmax:
+            assert not sbf_irreps, 'spherical_harmonics_lmax and spherical_basis_irreps cannot be provided simultaneously'
+            sh_lmax = int(sh_lmax)
+            self.irreps_sh = Irreps([(1, (i, 1 if self.no_parity else (-1) ** i)) for i in range(sh_lmax + 1)])
+            self.use_sbf = False
+        else:
+            assert sbf_irreps, 'at least one of spherical_harmonics_lmax and spherical_basis_irreps should be provided'
+            self.irreps_sh = Irreps(sbf_irreps)
+            self.use_sbf = True
+        
         irreps_mid = self._config.get('network', 'irreps_mid')
         if irreps_mid:
             self.irreps_mid_node = irreps_mid
@@ -172,7 +193,8 @@ class TrainConfig(BaseConfig):
         for Z, orbital_type in zip(index_to_Z, orbital_types):
             atom_orbitals[str(Z.item())] = orbital_type
             
-        target_blocks, net_out_irreps, irreps_post_edge = orbital_analysis(atom_orbitals, self.tbt0, spinful, targets=self._target_blocks, element_pairs=self.element_pairs, verbose=output_file)
+        target_blocks, net_out_irreps, irreps_post_edge = orbital_analysis(atom_orbitals, self.tbt0, spinful, targets=self._target_blocks, 
+                                                                           element_pairs=self.element_pairs, no_parity=self.no_parity, verbose=output_file)
         
         self._target_blocks = target_blocks
         if not self._net_out_irreps:
@@ -235,11 +257,11 @@ class EvalConfig(BaseConfig):
     def get_basic_section(self):
         # basic
         self.model_dir = self._config.get('basic', 'trained_model_dir')
-        self.device = torch.device(self._config.get('basic', 'device'))
-        dtype = self._config.get('basic', 'dtype')
-        self.set_dtype(dtype)
+        super().get_basic_section()
         self.out_dir = self._config.get('basic', 'output_dir')
         os.makedirs(self.out_dir, exist_ok=True)
         self.target = self._config.get('basic', 'target')
         self.inference = self._config.getboolean('basic', 'inference')
+        self.test_only = self._config.getboolean('basic', 'test_only')
+        if self.test_only: assert not self.inference
         

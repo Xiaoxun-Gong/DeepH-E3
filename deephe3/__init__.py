@@ -4,5 +4,5 @@ from .model import Net
 from .utils import LossRecord
 from .e3modules import Rotate, e3TensorDecomp
 
-from .kernel import e3AijKernel
+from .kernel import DeepHE3Kernel
 from .analyzer import testResultAnalyzer
