@@ -14,7 +14,7 @@ from .utils import flt2cplx
 
 
 class Collater:
-    def __init__(self, edge_Aij):
+    def __init__(self, edge_Aij=True):
         self.edge_Aij = edge_Aij
 
     def __call__(self, graph_list):
@@ -100,7 +100,10 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
               default_dtype_torch, data_folder,
               target_file_name='hamiltonian', inference=False, only_ij=False, create_from_DFT=True,
               huge_structure=False, only_get_R_list=False, numerical_tol=1e-8, **kwargs):
-    assert target_file_name in ['hamiltonians.h5', 'density_matrixs.h5']
+    if inference:
+        assert target_file_name in ['overlaps.h5']
+    else:
+        assert target_file_name in ['hamiltonians.h5', 'density_matrixs.h5']
     
     # get hopping dict from data_folder
     if data_folder is not None:
@@ -157,7 +160,7 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
             if only_ij:
                 if not is_ij(key):
                     continue
-            key_tensor = torch.tensor(key) # (R, i, j) i and j are 1-based indices, notice that this is different from deeph
+            key_tensor = torch.tensor(key) # ! (R, i, j) i and j are 1-based indices, notice that this is different from deeph
             # key_tensor = torch.tensor([key[0], key[1], key[2], key[3] - 1, key[4] - 1]) 
             # if separate_onsite:
             #     if key[0] == 0 and key[1] == 0 and key[2] == 0 and key[3] == key[4]:
@@ -294,6 +297,8 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
     if data_folder is not None:
         if inference:
             data = Data(x=numbers, edge_index=edge_idx, edge_attr=edge_fea, stru_id=stru_id,
+                        pos=cart_coords.type(default_dtype_torch),
+                        lattice=lattice.unsqueeze(0),
                         edge_key=edge_key,
                         Aij=None,
                         Aij_mask=None,

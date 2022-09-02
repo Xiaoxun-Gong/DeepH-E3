@@ -4,8 +4,8 @@ from e3nn.o3 import Irreps, angles_to_matrix
 import torch
 
 import sys, os
-sys.path.append('/home/gongxx/projects/DeepH/e3nn_DeepH/e3Aij')
-from e3Aij import Rotate
+sys.path.append('/home/gongxx/projects/DeepH/e3nn_DeepH/DeepH-E3')
+from deephe3 import Rotate
 
 # these need to be changed between different runs
 ori = h5py.File('/home/gongxx/projects/DeepH/e3nn_DeepH/structrues/1114_3xbi2se3/test_runs/2022-02-07_14-45-36_/test_out/original/hamiltonians_pred.h5')

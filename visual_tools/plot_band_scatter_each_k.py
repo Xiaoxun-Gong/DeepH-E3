@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Author: LiYang@cmt.tsinghua
 # Date: 2021.04.08
 # Descripution: This python code is designed for calculate the fermi energy

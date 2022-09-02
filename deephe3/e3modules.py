@@ -1,15 +1,16 @@
-from math import sqrt
-
 import torch
 from torch import nn
-from torch._C import dtype
 import torch.nn.functional as F
 from torch_scatter import scatter
 from torch_geometric.utils import degree
 
-from e3nn.o3 import Irrep, Irreps, wigner_3j, matrix_to_angles, Linear, FullyConnectedTensorProduct
+from e3nn.o3 import Irrep, Irreps, wigner_3j, matrix_to_angles, Linear, FullyConnectedTensorProduct, TensorProduct, SphericalHarmonics
 from e3nn.nn import Extract
 from .utils import flt2cplx, irreps_from_l1l2
+
+from .from_nequip.cutoffs import PolynomialCutoff
+from .from_dimenet.basis_utils import bessel_basis
+import sympy as sym
 
 
 class Rotate:
@@ -91,22 +92,39 @@ class Rotate:
         irreps_right = Irreps([(1, (l, (- 1) ** l)) for l in orbital_types_right])
         U_left = irreps_left.D_from_matrix(R_e3nn)
         U_right = irreps_right.D_from_matrix(R_e3nn)
-        openmx2wiki_left = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_left])
-        openmx2wiki_right = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_right])
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
         if self.spinful:
             U_left = torch.kron(self.D_one_half(R_e3nn), U_left)
             U_right = torch.kron(self.D_one_half(R_e3nn), U_right)
-            openmx2wiki_left = torch.block_diag(openmx2wiki_left, openmx2wiki_left)
-            openmx2wiki_right = torch.block_diag(openmx2wiki_right, openmx2wiki_right)
         return openmx2wiki_left.T @ U_left.transpose(-1, -2).conj() @ openmx2wiki_left @ H \
                @ openmx2wiki_right.T @ U_right @ openmx2wiki_right
 
+    def wiki2openmx_H_full(self, H, orbital_types_left, orbital_types_right):
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
+        return openmx2wiki_left.T @ H @ openmx2wiki_right
+
+    def openmx2wiki_H_full(self, H, orbital_types_left, orbital_types_right):
+        openmx2wiki_left, openmx2wiki_right = self.openmx2wiki_left_right(orbital_types_left, orbital_types_right)
+        return openmx2wiki_left @ H @ openmx2wiki_right.T
+    
     def wiki2openmx_H(self, H, l_left, l_right):
         return self.Us_openmx2wiki[l_left].T @ H @ self.Us_openmx2wiki[l_right]
 
     def openmx2wiki_H(self, H, l_left, l_right):
         return self.Us_openmx2wiki[l_left] @ H @ self.Us_openmx2wiki[l_right].T
 
+    def openmx2wiki_left_right(self, orbital_types_left, orbital_types_right):
+        if isinstance(orbital_types_left, int):
+            orbital_types_left = [orbital_types_left]
+        if isinstance(orbital_types_right, int):
+            orbital_types_right = [orbital_types_right]
+        openmx2wiki_left = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_left])
+        openmx2wiki_right = torch.block_diag(*[self.Us_openmx2wiki[l] for l in orbital_types_right])
+        if self.spinful:
+            openmx2wiki_left = torch.block_diag(openmx2wiki_left, openmx2wiki_left)
+            openmx2wiki_right = torch.block_diag(openmx2wiki_right, openmx2wiki_right)
+        return openmx2wiki_left, openmx2wiki_right
+    
     def rotate_matrix_convert(self, R):
         # (x, y, z)顺序排列的旋转矩阵转换为(y, z, x)顺序(see e3nn.o3.spherical_harmonics() and https://docs.e3nn.org/en/stable/guide/change_of_basis.html)
         return torch.eye(3)[[1, 2, 0]] @ R @ torch.eye(3)[[1, 2, 0]].T # todo: cuda
@@ -165,7 +183,7 @@ class sort_irreps(torch.nn.Module):
 
 
 class e3TensorDecomp:
-    def __init__(self, net_irreps_out, out_js_list, default_dtype_torch, spinful=False, if_sort=False, device_torch='cpu'):
+    def __init__(self, net_irreps_out, out_js_list, default_dtype_torch, spinful=False, no_parity=False, if_sort=False, device_torch='cpu'):
         if spinful:
             default_dtype_torch = flt2cplx(default_dtype_torch)
         self.dtype = default_dtype_torch
@@ -195,7 +213,7 @@ class e3TensorDecomp:
             #     if len(net_irreps_out) < len(required_irreps_out) + 1:
             #         raise ValueError('Net irreps out and target does not match')
             #     mul = net_irreps_out[len(required_irreps_out)].mul
-            _, required_irreps_out_single, required_irreps_x1 = irreps_from_l1l2(H_l1, H_l2, mul, spinful)
+            _, required_irreps_out_single, required_irreps_x1 = irreps_from_l1l2(H_l1, H_l2, mul, spinful, no_parity=no_parity)
             required_irreps_out += required_irreps_out_single
             
             # spinful case, example: (1x0.5)x(2x0.5) = (1+2+3)x(0+1) = (1+2+3)+(0+1+2)+(1+2+3)+(2+3+4)
@@ -454,6 +472,7 @@ class e3LayerNorm(nn.Module):
                 
         return out
 
+
 class e3ElementWise:
     def __init__(self, irreps_in):
         self.irreps_in = Irreps(irreps_in)
@@ -484,83 +503,137 @@ class e3ElementWise:
         return torch.cat(out, dim=-1)
 
 
-# complex version of several modules
-
-class cplxE3Linear(Linear):
-    def __init__(self, *args, **kwargs):
-        is_complex = kwargs.pop('is_complex', False)
-        super().__init__(*args, **kwargs)
-        if is_complex:
-            assert self.internal_weights # only support internal_weights=True
-            self.weight = nn.Parameter(torch.randn(self.weight_numel, dtype=flt2cplx(torch.get_default_dtype()))) # TODO: initialization method
-
-class cplxFullyConnectedTensorProduct(FullyConnectedTensorProduct):
-    def __init__(self, *args, **kwargs):
-        is_complex = kwargs.pop('is_complex', False)
-        super().__init__(*args, **kwargs)
-        if is_complex:
-            assert self.internal_weights # only support internal_weights=True
-            self.weight = nn.Parameter(torch.randn(self.weight_numel, dtype=flt2cplx(torch.get_default_dtype())))
-            for attr in dir(self._compiled_main_out):
-                if attr[:4] == '_w3j':
-                    setattr(self._compiled_main_out, attr, 
-                            getattr(self._compiled_main_out, attr).type(flt2cplx(torch.get_default_dtype())))
-
-class cplxLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None, is_complex=False) -> None:
-        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
-        if is_complex:
-            factory_kwargs = {'device': device, 'dtype': flt2cplx(torch.get_default_dtype())}
-            self.weight = nn.Parameter(torch.randn((out_features, in_features), **factory_kwargs)) # TODO complex initialization
-            if bias:
-                self.bias = nn.Parameter(torch.randn(out_features, **factory_kwargs))
-
-class modSiLU(nn.Module):
-    def __init__(self, input_size, eps=1e-5):
+class SkipConnection(nn.Module):
+    def __init__(self, irreps_in, irreps_out, is_complex=False):
         super().__init__()
-        self.bias = nn.Parameter(torch.normal(0.88, 0.5, input_size)) # randomly generated complex number has mean mod 0.88
-        self.eps = eps
+        irreps_in = Irreps(irreps_in)
+        irreps_out = Irreps(irreps_out)
+        self.sc = None
+        if irreps_in == irreps_out:
+            self.sc = None
+        else:
+            self.sc = Linear(irreps_in=irreps_in, irreps_out=irreps_out)
     
-    def forward(self, x):
-        mod = x.abs()
-        act_mod =F.silu(mod - self.bias)
-        return x * act_mod / (mod + self.eps)
+    def forward(self, old, new):
+        if self.sc is not None:
+            old = self.sc(old)
+        
+        return old + new
 
-def CSiLU(x):
-    if x.dtype in [torch.float32, torch.float64]:
-        out = F.silu(x)
-    else:
-        out = F.silu(torch.real(x)) + 1j * F.silu(torch.imag(x))
-    return out
 
-class CSiLU_module(nn.Module):
-    def __init__(self):
+class SelfTp(nn.Module):
+    def __init__(self, irreps_in, irreps_out, **kwargs):
+        '''z_i = W'_{ij}x_j W''_{ik}x_k (k>=j)'''
         super().__init__()
+        
+        assert not kwargs.pop('internal_weights', False) # internal weights must be True
+        assert kwargs.pop('shared_weights', True) # shared weights must be false
+        
+        irreps_in = Irreps(irreps_in)
+        irreps_out = Irreps(irreps_out)
+        
+        instr_tp = []
+        weights1, weights2 = [], []
+        for i1, (mul1, ir1) in enumerate(irreps_in):
+            for i2 in range(i1, len(irreps_in)):
+                mul2, ir2 = irreps_in[i2]
+                for i_out, (mul_out, ir3) in enumerate(irreps_out):
+                    if ir3 in ir1 * ir2:
+                        weights1.append(nn.Parameter(torch.randn(mul1, mul_out)))
+                        weights2.append(nn.Parameter(torch.randn(mul2, mul_out)))
+                        instr_tp.append((i1, i2, i_out, 'uvw', True, 1.0))
+        
+        self.tp = TensorProduct(irreps_in, irreps_in, irreps_out, instr_tp, internal_weights=False, shared_weights=True, **kwargs)
+        
+        self.weights1 = nn.ParameterList(weights1)
+        self.weights2 = nn.ParameterList(weights2)
+        
     def forward(self, x):
-        return CSiLU(x)
+        weights = []
+        for weight1, weight2 in zip(self.weights1, self.weights2):
+            weight = weight1[:, None, :] * weight2[None, :, :]
+            weights.append(weight.view(-1))
+        weights = torch.cat(weights)
+        return self.tp(x, x, weights)
+    
 
-def CTanh(x):
-    if x.dtype in [torch.float32, torch.float64]:
-        out = torch.tanh(x)
-    else:
-        out = torch.tanh(torch.real(x)) + 1j * torch.tanh(torch.imag(x))
-    return out
+class SeparateWeightTensorProduct(nn.Module):
+    def __init__(self, irreps_in1, irreps_in2, irreps_out, **kwargs):
+        '''z_i = W'_{ij}x_j W''_{ik}y_k'''
+        super().__init__()
+        
+        assert not kwargs.pop('internal_weights', False) # internal weights must be True
+        assert kwargs.pop('shared_weights', True) # shared weights must be false
+        
+        irreps_in1 = Irreps(irreps_in1)
+        irreps_in2 = Irreps(irreps_in2)
+        irreps_out = Irreps(irreps_out)
+                
+        instr_tp = []
+        weights1, weights2 = [], []
+        for i1, (mul1, ir1) in enumerate(irreps_in1):
+            for i2, (mul2, ir2) in enumerate(irreps_in2):
+                for i_out, (mul_out, ir3) in enumerate(irreps_out):
+                    if ir3 in ir1 * ir2:
+                        weights1.append(nn.Parameter(torch.randn(mul1, mul_out)))
+                        weights2.append(nn.Parameter(torch.randn(mul2, mul_out)))
+                        instr_tp.append((i1, i2, i_out, 'uvw', True, 1.0))
+        
+        self.tp = TensorProduct(irreps_in1, irreps_in2, irreps_out, instr_tp, internal_weights=False, shared_weights=True, **kwargs)
+        
+        self.weights1 = nn.ParameterList(weights1)
+        self.weights2 = nn.ParameterList(weights2)
+        
+    def forward(self, x1, x2):
+        weights = []
+        for weight1, weight2 in zip(self.weights1, self.weights2):
+            weight = weight1[:, None, :] * weight2[None, :, :]
+            weights.append(weight.view(-1))
+        weights = torch.cat(weights)
+        return self.tp(x1, x2, weights)
 
-def CSigmoid(x):
-    if x.dtype in [torch.float32, torch.float64]:
-        out = torch.sigmoid(x)
-    else:
-        out = torch.sigmoid(torch.real(x)) + 1j * torch.sigmoid(torch.imag(x))
-    return out
 
-def get_complex_activation(act):
-    if act == F.silu:
-        act_out = CSiLU
-    elif act == torch.tanh:
-        act_out = CTanh
-    elif act == torch.sigmoid:
-        act_out = CSigmoid
-    else:
-        raise NotImplementedError(f'Cannot find the complex form of activation function {act}')
-    return act_out
+class SphericalBasis(nn.Module):
+    def __init__(self, target_irreps, rcutoff, eps=1e-7, dtype=torch.get_default_dtype()):
+        super().__init__()
+        
+        target_irreps = Irreps(target_irreps)
+        
+        self.sh = SphericalHarmonics(
+            irreps_out=target_irreps,
+            normalize=True,
+            normalization='component',
+        )
+        
+        max_order = max(map(lambda x: x[1].l, target_irreps)) # maximum angular momentum l
+        max_freq = max(map(lambda x: x[0], target_irreps)) # maximum multiplicity
+        
+        basis = bessel_basis(max_order + 1, max_freq)
+        lambdify_torch = {
+            # '+': torch.add,
+            # '-': torch.sub,
+            # '*': torch.mul,
+            # '/': torch.div,
+            # '**': torch.pow,
+            'sin': torch.sin,
+            'cos': torch.cos
+        }
+        x = sym.symbols('x')
+        funcs = []
+        for mul, ir in target_irreps:
+            for freq in range(mul):
+                funcs.append(sym.lambdify([x], basis[ir.l][freq], [lambdify_torch]))
+                
+        self.bessel_funcs = funcs
+        self.multiplier = e3ElementWise(target_irreps)
+        self.dtype = dtype
+        self.cutoff = PolynomialCutoff(rcutoff, p=6)
+        self.register_buffer('rcutoff', torch.Tensor([rcutoff]))
+        self.irreps_out = target_irreps
+        self.register_buffer('eps', torch.Tensor([eps]))
+        
+    def forward(self, length, direction):
+        # direction should be in y, z, x order
+        sh = self.sh(direction).type(self.dtype)
+        sbf = torch.stack([f((length + self.eps) / self.rcutoff) for f in self.bessel_funcs], dim=-1)
+        return self.multiplier(sh, sbf) * self.cutoff(length)[:, None]
