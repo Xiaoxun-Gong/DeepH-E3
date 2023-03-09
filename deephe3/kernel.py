@@ -655,10 +655,12 @@ class DeepHE3Kernel:
     def save_test_result(self, batch, H_pred, h5_fp):
         assert batch.num_graphs == 1
         stru_id = batch.stru_id[0]
-
+        
+        batch = batch.to('cpu')
+        if isinstance(H_pred, torch.Tensor):
+            H_pred = H_pred.cpu().numpy()
+   
         if stru_id in h5_fp:
-            if isinstance(H_pred, torch.Tensor):
-                H_pred = H_pred.cpu().numpy()
             g = h5_fp[stru_id]
             for name in ['H_pred', 'label', 'mask']:
                 prev = np.array(g[name])
@@ -666,21 +668,21 @@ class DeepHE3Kernel:
                 if name == 'H_pred':
                     g[name] = np.concatenate((prev, H_pred), axis=-1)
                 else:
-                    g[name] = np.concatenate((prev, getattr(batch, name).cpu()), axis=-1)
+                    g[name] = np.concatenate((prev, getattr(batch, name)), axis=-1)
         else:
             g = h5_fp.create_group(stru_id)
-            g['node_attr'] = batch.x.cpu()
-            g['edge_index'] = batch.edge_index.cpu()
-            g['edge_key'] = batch.edge_key.cpu()
-            g['edge_attr'] = batch.edge_attr.cpu()
-            g['label'] = batch.label.cpu()
-            g['mask'] = batch.mask.cpu()
-            g['H_pred'] = H_pred.cpu()
+            g['node_attr'] = batch.x
+            g['edge_index'] = batch.edge_index
+            g['edge_key'] = batch.edge_key
+            g['edge_attr'] = batch.edge_attr
+            g['label'] = batch.label
+            g['mask'] = batch.mask
+            g['H_pred'] = H_pred
             
             stru = g.create_group('structure')
-            stru['element'] = self.dataset_info.index_to_Z[batch.x].cpu()
-            stru['lat'] = batch.lattice[0].cpu()
-            stru['sites'] = batch.pos.cpu()
+            stru['element'] = self.dataset_info.index_to_Z[batch.x]
+            stru['lat'] = batch.lattice[0]
+            stru['sites'] = batch.pos
         
         '''test_result.h5 file structure
         +--"/"
@@ -795,38 +797,45 @@ class DeepHE3Kernel:
         assert train_size + val_size + test_size <= dataset_size
 
         np.random.shuffle(indices)
-        print(f'size of train set: {len(indices[:train_size])}')
-        print(f'size of val set: {len(indices[train_size:train_size + val_size])}')
-        print(f'size of test set: {len(indices[train_size + val_size:train_size + val_size + test_size])}')
-        print(f'Batch size: {config.batch_size}')
-        if config.extra_val:
-            print(f'Additionally validating on {len(extra_val_indices)} structure(s)')
+        
 
+        print(f'size of train set: {len(indices[:train_size])}')
         train_loader = DataLoader(dataset, 
                                   batch_size=config.batch_size,
                                   shuffle=False, 
                                   sampler=SubsetRandomSampler(indices[:train_size]),
                                   collate_fn=Collater())
+        
+        val_indices = indices[train_size:train_size + val_size]
+        print(f'size of val set: {len(val_indices)}')
+        if config.extra_val and not config.extra_val_test_only:
+            val_indices.extend(extra_val_indices)
         val_loader = DataLoader(dataset,
                                 batch_size=config.batch_size,
                                 shuffle=False,
-                                sampler=SubsetRandomSampler(indices[train_size:train_size + val_size]),
+                                sampler=SubsetRandomSampler(val_indices),
                                 collate_fn=Collater())
+        
         extra_val_loader = None
         if config.extra_val:
+            print(f'Additionally validating on {len(extra_val_indices)} structure(s)')
             extra_val_loader = DataLoader(dataset,
                                           batch_size=config.batch_size,
                                           shuffle=False,
                                           sampler=SubsetRandomSampler(extra_val_indices),
                                           collate_fn=Collater())
+        
         test_indices = indices[train_size + val_size:train_size + val_size + test_size]
         if config.extra_val:
             test_indices.extend(extra_val_indices)
+        print(f'size of test set: {len(test_indices)}')
         test_loader = DataLoader(dataset,
                                  batch_size=1,
                                  shuffle=False,
                                  sampler=SubsetRandomSampler(test_indices),
                                  collate_fn=Collater())
+        
+        print(f'Batch size: {config.batch_size}')
         
         return train_loader, val_loader, extra_val_loader, test_loader
     

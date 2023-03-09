@@ -38,7 +38,7 @@ class testResultAnalyzer:
         return 0
     
     def error_plot(self, include=[], exclude=[], mode='mae'):
-        if mode not in ['mae', 'mse']:
+        if mode not in ['mae', 'mse', 'rmse']:
             print(f'Unknown mode: {mode}')
             return 1
         
@@ -78,7 +78,7 @@ class testResultAnalyzer:
                 # mask = np.array(g['mask'])
                 
                 error_pre = np.abs(H_pred - label)
-                if mode == 'mse':
+                if mode in ('mse', 'rmse'):
                     error_pre = np.power(error_pre, 2)
                 n += 1
         
@@ -103,7 +103,6 @@ class testResultAnalyzer:
                         if self.dataset_info.spinful:
                             error = error.real
                         
-                        error *= 1e3 # convert to meV
                         if errors[i][j] is None:
                             errors[i][j] = error
                         else:
@@ -112,6 +111,9 @@ class testResultAnalyzer:
         for i in range(num_element):
             for j in range(num_element):
                 errors[i][j] /= n
+                if mode == 'rmse':
+                    errors[i][j] = np.sqrt(errors[i][j])
+                errors[i][j] *= 1000 # convert to meV
         
         summary_info = f'Summary of prediction error\nType: {mode}, unit: meV\n\n'
         for i in range(num_element): 

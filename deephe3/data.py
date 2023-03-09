@@ -1,7 +1,6 @@
 from typing import Union, Dict, Tuple, List
 import os
 import time
-from click import option
 import tqdm
 
 from pymatgen.core.structure import Structure
@@ -132,9 +131,15 @@ raw_data_dir
     def process_worker(self, folder, **kwargs):
         stru_id = os.path.split(folder)[-1]
 
+        
+        site_positions = np.loadtxt(os.path.join(folder, 'site_positions.dat')).T
+        elements = np.loadtxt(os.path.join(folder, 'element.dat'))
+        if len(elements.shape) == 0:
+            elements = elements[None]
+            site_positions = site_positions[None, :]
         structure = Structure(np.loadtxt(os.path.join(folder, 'lat.dat')).T,
-                              np.loadtxt(os.path.join(folder, 'element.dat')),
-                              np.loadtxt(os.path.join(folder, 'site_positions.dat')).T,
+                              elements,
+                              site_positions,
                               coords_are_cartesian=True,
                               to_unit_cell=False)
 
@@ -160,6 +165,7 @@ raw_data_dir
         assert len(folder_list) != 0, "Can not find any structure"
         print('Found %d structures, have cost %d seconds' % (len(folder_list), time.time() - begin))
 
+        begin = time.time()
         if self.multiprocessing:
             print('Use multiprocessing')
             with Pool() as pool:
@@ -181,9 +187,10 @@ raw_data_dir
             orbital_types_new.append(orbital_types[np.where(elements == index_to_Z[i].numpy())[0][0]])
         #TODO 数据集包含不同元素
 
+        begin = time.time()
         data, slices = self.collate(data_list)
         torch.save((data, slices, dict(spinful=spinful, index_to_Z=index_to_Z, Z_to_index=Z_to_index, orbital_types=orbital_types_new)), self.data_file)
-        print('Finished saving %d structures to raw_data_file, have cost %d seconds' % (len(data_list), time.time() - begin))
+        print('Finished saving %d structures to save_graph_dir, have cost %d seconds' % (len(data_list), time.time() - begin))
 
     def element_statistics(self, data_list):
         # TODO 没有处理数据集包括不同元素组成的情况

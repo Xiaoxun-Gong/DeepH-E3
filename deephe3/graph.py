@@ -122,6 +122,7 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
                     if not is_ij(key):
                         continue
                 key = (key[0], key[1], key[2], key[3] - 1, key[4] - 1)
+                v = np.array(v) # first read to np.ndarray format to enable faster conversion to torch.Tensor
                 # if spinful:
                 #     num_orbital_row = atom_num_orbital[key[3]]
                 #     num_orbital_column = atom_num_orbital[key[4]]

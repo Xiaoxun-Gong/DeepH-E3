@@ -301,7 +301,7 @@ class e3TensorDecomp:
                                            [  0, -1j,   0,   1],
                                            [  0,  1j,   0,   1],
                                            [  1,   0,  -1,   0]],
-                                            dtype=torch.complex64, device=device_torch) / sqrt2
+                                            dtype=default_dtype_torch, device=device_torch) / sqrt2
         
         self.sort = None
         if if_sort:
@@ -385,7 +385,7 @@ class e3TensorDecomp:
         
 
 class e3LayerNorm(nn.Module):
-    def __init__(self, irreps_in, eps=1e-5, affine=True, normalization='component', subtract_mean=True, divide_norm=False):
+    def __init__(self, irreps_in, eps=1e-5, affine=True, normalization='component', subtract_mean=True, divide_norm=True):
         super().__init__()
         
         self.irreps_in = Irreps(irreps_in)

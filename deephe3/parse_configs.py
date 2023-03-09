@@ -40,7 +40,7 @@ class BaseConfig:
         self.target_data = self._config.get('data', 'target_data')
         self.dataset_name = self._config.get('data', 'dataset_name')
         
-        self.get_olp = self._config.get('data', 'get_overlap')
+        self.get_olp = self._config.getboolean('data', 'get_overlap')
         
         self.only_ij = False # todo
     
@@ -49,7 +49,7 @@ class BaseConfig:
             self.torch_dtype = torch.float32
             self.np_dtype = np.float32
         elif dtype == 'double':
-            self.torch_dtype == torch.float64
+            self.torch_dtype = torch.float64
             self.np_dtype = np.float64
         else:
             raise NotImplementedError
@@ -108,6 +108,7 @@ class TrainConfig(BaseConfig):
             
         ev = self._config.get('train', 'extra_validation')
         self.extra_val = eval(ev) if ev else []
+        self.extra_val_test_only = self._config.getboolean('train', 'extra_val_test_only')
         
         self.train_ratio = self._config.getfloat('train', 'train_ratio')
         self.val_ratio = self._config.getfloat('train', 'val_ratio')

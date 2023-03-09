@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import json
 import copy
 
+from_json = True
+
 BOHR = 0.529177210903 #A
 HARTREE = 27.21138602 #eV
 GREEK_SYMBOLS = ['Gamma','Delta','Theta','Lambda','Xi',
@@ -450,8 +452,8 @@ def band_plot(band_data_obj, plot_args):
   # Save the figure
   plot_filename = "%s.%s" %(file_tag, plot_format)
   plt.tight_layout()
-  plt.savefig(plot_filename, format=plot_format, dpi=plot_dpi, transparent=True)
-  plt.savefig('band.svg', transparent=True)
+  plt.savefig(plot_filename, format=plot_format, dpi=plot_dpi, transparent=False)
+  plt.savefig('band.svg', transparent=False)
   return 
 
 
@@ -459,9 +461,18 @@ def band():
   '''band functions'''
   plot_args = get_command_line_input()
   band_data_obj = BandData(plot_args["data_type"])
-  band_data_obj.file_read(plot_args["data_filename"])
-  band_data_obj.get_band_data()
-  band_save_to_json(band_data_obj.band_data, plot_args["file_tag"])
+  if not from_json:
+    band_data_obj.file_read(plot_args["data_filename"])
+    band_data_obj.get_band_data()
+    band_save_to_json(band_data_obj.band_data, plot_args["file_tag"])
+  else:
+    with open('band.json', 'r') as f:
+      data_new = json.load(f)
+    for key, val in data_new.items():
+      if type(val) is list:
+        data_new[key] = np.array(val)
+    band_data_obj.band_data = data_new
+  # ==
   if not plot_args["no_plot"]:
     band_plot(band_data_obj, plot_args)
 

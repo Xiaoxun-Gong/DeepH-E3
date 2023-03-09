@@ -51,7 +51,7 @@ while True:
     elif option == '4':
         # print('Input structure name:')
         # stru_name = input()
-        print('Error mode: (mae/mse/maxe)')
+        print('Error mode: (mae/mse/maxe/rmse)')
         mode = input()
         print('Structures to include:')
         print(' - Separate structure names by space; support regular expressions; leave empty to include all')
