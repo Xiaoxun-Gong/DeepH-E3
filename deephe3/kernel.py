@@ -349,6 +349,15 @@ class DeepHE3Kernel:
         for index_model, model_path in enumerate(model_path_list):
             print(f'\nLoading model {index_model}:')
             self.load_config(train_config_path=os.path.join(model_path, 'src/train.ini'))
+            if eval_config.inference:
+                # If inference=True, then info.json might not be present in processed_data.
+                # Then spinful should come from network, not from dataset.
+                net_out_info = NetOutInfo.from_json(os.path.join(model_path, 'src'))
+                if self.dataset_info.spinful != net_out_info.dataset_info.spinful:
+                    print(f'WARNING: Dataset spinful={self.dataset_info.spinful} but network spinful={net_out_info.dataset_info.spinful}. Overwritting dataset spinful with network value.')
+                    print(f'         This might be caused by not providing info.json in processed data folder.')
+                    print(f'         If you see this message, please replace info.json in processed data folder with the one written in output_dir.')
+                    self.dataset_info.spinful = net_out_info.dataset_info.spinful
             self.config_set_target()
             if not eval_config.inference:
                 dataset.set_mask(self.train_config.target_blocks, del_Aij=False, convert_to_net=self.train_config.convert_net_out)
@@ -406,11 +415,23 @@ class DeepHE3Kernel:
         if not eval_config.test_only:
             print('\n------- Output -------')
             for H_dict, data in zip(H_pred_list, dataset):
-                os.makedirs(os.path.join(eval_config.out_dir, data.stru_id), exist_ok=True)
+                outdir = os.path.join(eval_config.out_dir, data.stru_id)
+                os.makedirs(outdir, exist_ok=True)
                 print(f'Writing output to "{data.stru_id}/hamiltonians_pred.h5"')
                 with h5py.File(os.path.join(eval_config.out_dir, f'{data.stru_id}/hamiltonians_pred.h5'), 'w') as f:
                     for k, v in H_dict.items():
                         f[k] = v
+                
+                # write info.json to output dir
+                infofile = os.path.join(outdir, 'info.json')
+                if os.path.isfile(infofile):
+                    with open(infofile, 'r') as f:
+                        infodict = json.load(f)
+                else:
+                    infodict = {}
+                infodict["isspinful"] = self.dataset_info.spinful
+                with open(infofile, 'w') as f:
+                    json.dump(infodict, f)
         
     def get_graph(self, config: BaseConfig, inference=False): # todo: dataset info stored separately
         process_only = config.__class__ == BaseConfig # isinstance(config, BaseConfig)
@@ -521,6 +542,17 @@ class DeepHE3Kernel:
         assert os.path.isdir(src_path)
         sys.path.append(src_path)
         
+        # load dataset_info and net_out_info
+        net_out_info_o = NetOutInfo.from_json(src_path)
+        if self.dataset_info is None:
+            self.dataset_info = net_out_info_o.dataset_info
+        else:
+            assert self.dataset_info == net_out_info_o.dataset_info
+        if self.net_out_info is None:
+            self.net_out_info = net_out_info_o
+        else:
+            assert self.net_out_info == net_out_info_o
+        
         print('Building model...')
         begin = time.time()
         from build_model import net
@@ -532,17 +564,6 @@ class DeepHE3Kernel:
         net.to(device)
         
         self.net = net
-        
-        # load dataset_info and net_out_info
-        net_out_info_o = NetOutInfo.from_json(src_path)
-        if self.dataset_info is None:
-            self.dataset_info = net_out_info_o.dataset_info
-        else:
-            assert self.dataset_info == net_out_info_o.dataset_info
-        if self.net_out_info is None:
-            self.net_out_info = net_out_info_o
-        else:
-            assert self.net_out_info == net_out_info_o
             
         return net
         

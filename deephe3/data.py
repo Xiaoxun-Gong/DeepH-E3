@@ -158,7 +158,7 @@ raw_data_dir
         folder_list = []
         print(f'Looking for preprocessed data under: {self.raw_data_dir}')
         for root, dirs, files in os.walk(self.raw_data_dir):
-            if {'element.dat', 'orbital_types.dat', 'info.json', 'lat.dat', 'site_positions.dat'}.issubset(files):
+            if {'element.dat', 'orbital_types.dat', 'lat.dat', 'site_positions.dat'}.issubset(files):
                 if self.target_file_name in files:
                     folder_list.append(root)
         folder_list = folder_list[: self.nums]

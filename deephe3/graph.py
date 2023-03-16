@@ -108,10 +108,16 @@ def get_graph(cart_coords, frac_coords, numbers, stru_id, r, max_num_nbr, edge_A
     # get hopping dict from data_folder
     if data_folder is not None:
         atom_num_orbital = load_orbital_types(os.path.join(data_folder, 'orbital_types.dat'))
-
-        with open(os.path.join(data_folder, 'info.json'), 'r') as info_f:
-            info_dict = json.load(info_f)
-            spinful = info_dict["isspinful"]
+        
+        if os.path.isfile(os.path.join(data_folder, 'info.json')):
+            with open(os.path.join(data_folder, 'info.json'), 'r') as info_f:
+                info_dict = json.load(info_f)
+                spinful = info_dict["isspinful"]
+        elif not inference:
+            msg = 'Must provide info.json in processed structure folder if not under inference mode.'
+            raise AssertionError(msg)
+        else:
+            spinful = False
 
         if inference == False:
             Aij_dict = {}
