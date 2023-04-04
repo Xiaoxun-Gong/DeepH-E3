@@ -385,7 +385,7 @@ class e3TensorDecomp:
         
 
 class e3LayerNorm(nn.Module):
-    def __init__(self, irreps_in, eps=1e-5, affine=True, normalization='component', subtract_mean=True, divide_norm=True):
+    def __init__(self, irreps_in, eps=1e-5, affine=True, normalization='component', subtract_mean=True, divide_norm=False):
         super().__init__()
         
         self.irreps_in = Irreps(irreps_in)

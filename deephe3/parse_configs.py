@@ -71,6 +71,9 @@ class TrainConfig(BaseConfig):
         self.get_data_section()
         self.get_train_section()
         
+        if self.use_new_hypp:
+            self.get_hypp_section()
+        
         if self.checkpoint_dir:
             assert self.checkpoint_dir.endswith('.pkl'), 'checkpoint should point to model.pkl or best_model.pkl'
             config1_path = os.path.join(os.path.dirname(self.checkpoint_dir), 'src/train.ini')
@@ -79,7 +82,9 @@ class TrainConfig(BaseConfig):
             self.get_config(config1_path, config_file_default=train_default)
         
         # overwrite settings using those in config
-        self.get_hypp_section()
+        if not self.use_new_hypp:
+            self.get_hypp_section()
+        
         self.get_target_section()
         self.get_network_section()
         
@@ -91,6 +96,7 @@ class TrainConfig(BaseConfig):
         self.seed = self._config.getint('basic', 'seed')
         self.checkpoint_dir = self._config.get('basic', 'checkpoint_dir')
         self.simp_out = self._config.getboolean('basic', 'simplified_output')
+        self.use_new_hypp = self._config.getboolean('basic', 'use_new_hypp')
 
         # = save to time folder =
         save_dir = self._config.get('basic', 'save_dir')

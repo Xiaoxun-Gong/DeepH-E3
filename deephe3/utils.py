@@ -1,5 +1,4 @@
 import os
-from sched import scheduler
 import shutil
 import sys
 import random

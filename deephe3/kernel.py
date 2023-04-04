@@ -230,8 +230,16 @@ class DeepHE3Kernel:
             print(f'Loading from checkpoint at {config.checkpoint_dir}')
             checkpoint = torch.load(config.checkpoint_dir, map_location='cpu')
             net.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if config.use_new_hypp:
+                epoch = checkpoint['epoch']
+                scheduler.next_epoch = epoch + 1
+                if config.scheduler_type == 1:
+                    scheduler.scheduler.last_epoch = epoch
+                elif config.scheduler_type == 2:
+                    scheduler.scheduler.next_epoch = epoch + 1
+            else:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             with open(os.path.join(config.save_dir, 'tensorboard/info.json'), 'r') as f:
                 global_step = json.load(f)['global_step'] + 1
             best_loss = checkpoint['val_loss']
