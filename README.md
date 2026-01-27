@@ -4,7 +4,7 @@ This code is the implementation of the DeepH-E3 method described in the paper *G
 
 You can find demo input files and instructions in these repositories: [Dataset 1](https://doi.org/10.5281/zenodo.7553640), [Dataset 2](https://doi.org/10.5281/zenodo.7553827) and [Dataset 3](https://doi.org/10.5281/zenodo.7553843). These are also the datasets used by the paper, so you can try to reproduce the results in the paper using those datasets.
 
-The current code will be integrated into [DeepH-pack](https://github.com/mzjb/DeepH-pack) in the future.
+New users are encouraged to use [DeepH-pack](https://docs.deeph-pack.com/deeph-pack), the latest package by the DeepH team, which provides a comprehensive toolkit for deep-learning electronic structure calculations. 
 
 ## Installation
 
@@ -77,3 +77,4 @@ Once you have a trained model, you can use that model to predict the Hamiltonian
 The default config file for `eval.ini` can be found in `DeepH-E3/deephe3/default_configs/eval_default.ini`. This default config also includes a description of each input variables.
 
 For large structures that are impossible to calculate with DFT, one needs the modified OpenMX code that only generates the overlap matrix: [Overlap-only-OpenMX](https://github.com/mzjb/overlap-only-OpenMX). In this case, DeepH-E3 needs the processed `overlaps.h5` instead of `hamiltonians.h5` to generate the crystal graph. You have to set `inference=True` in `eval.ini`.
+
